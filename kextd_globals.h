@@ -25,4 +25,26 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-#include <IOKit/kext/kextmanager_mig.defs>
+#ifndef _KEXTD_GLOBALS_H
+#define _KEXTD_GLOBALS_H
+
+// currently not suitable for sharing with other tools
+// xxx - NOT SUPPOSED TO BE SHARED WITH OTHER TOOLS!
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <libc.h>
+
+#define kKextdDiskArbMaxRetries   (10)
+
+// kextd_main.c
+extern const NXArchInfo     * gKernelArchInfo;
+
+// kextd_mig_server.c
+extern uid_t                  gClientUID;  // set & cleared by kextd_demux()
+
+// serialize_kextload.c
+extern CFMachPortRef          _gKextutilLock;
+extern Boolean                gKernelRequestsPending;
+
+#endif _KEXTD_GLOBALS_H

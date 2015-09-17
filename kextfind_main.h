@@ -27,10 +27,27 @@
 #include <libc.h>
 #include <getopt.h>
 #include <mach-o/arch.h>
+#include <sysexits.h>
 
 #include <IOKit/IOTypes.h>
+#include <IOKit/kext/OSKext.h>
+#include <IOKit/kext/fat_util.h>
 
+
+#include "kext_tools_util.h"
 #include "QEQuery.h"
+
+#pragma mark Basic Types & Constants
+/*******************************************************************************
+* Constants
+*******************************************************************************/
+
+enum {
+    kKextfindExitOK          = EX_OK,
+
+    // don't actually exit with this, it's just a sentinel value
+    kKextfindExitHelp        = 33,
+};
 
 /*******************************************************************************
 * Data types.
@@ -60,20 +77,25 @@ typedef struct {
     * during the search.
     */
     KextfindAssertiveness assertiveness;
+    const NXArchInfo    * defaultArch;
 
-    Boolean caseInsensitive;
-    Boolean extraInfo;       // currently unused, see EXTRA_INFO ifdefs
+    Boolean  caseInsensitive;
+    Boolean  extraInfo;       // currently unused, see EXTRA_INFO ifdefs
     PathSpec pathSpec;
-    Boolean substrings;
+    Boolean  substrings;
+
+    CFMutableArrayRef searchURLs;
 
    /* These fields are set by the parsing callbacks to determine what
     * expensive operations the kext manager needs to perform before the
     * query can be evaluated.
     */
     Boolean checkLoaded;
+
+   /* Kext integrity is no longer used on SnowLeopard. We read the
+    * flags but no kext will ever match them now.
+    */
     Boolean checkIntegrity;
-    Boolean checkAuthentic;
-    Boolean checkLoadable;
 
    /* This field is set by the parsing callbacks. If no commands are given
     * in the query, a default "print" will be executed for each matching
@@ -92,14 +114,16 @@ typedef struct {
 } QueryContext;
 
 /*******************************************************************************
-* Misc strings.
+* Function prototypes.
 *******************************************************************************/
-#define kErrorStringMemoryAllocation         "memory allocation failure\n"
-#define kErrorStringIllegalVersionExpression "illegal version expression '%s'\n"
+ExitStatus readArgs(
+    int            argc,
+    char * const * argv,
+    QueryContext * toolArgs);
+ExitStatus checkArgs(QueryContext * toolArgs);
+Boolean checkSearchItem(const char * pathname, Boolean logFlag);
+fat_iterator createFatIteratorForKext(OSKextRef aKext);
+void usage(UsageLevel level);
 
-/*******************************************************************************
-* Shared functions.
-*******************************************************************************/
-char * cStringForCFString(CFStringRef string);
 
 #endif /* _KEXTFIND_H_ */

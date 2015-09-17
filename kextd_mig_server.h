@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2008 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -25,4 +25,8 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-#include <IOKit/kext/kextmanager_mig.defs>
+void kextd_mach_port_callback(
+    CFMachPortRef  port,
+    void         * msg,
+    CFIndex        size,
+    void         * info);

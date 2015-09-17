@@ -1,14 +1,19 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
  *
- * @APPLE_LICENSE_HEADER_START@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
- * compliance with the License. Please obtain a copy of the License at
- * http://www.opensource.apple.com/apsl/ and read it before using this
- * file.
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ * 
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
  * 
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
@@ -18,7 +23,7 @@
  * Please see the License for the specific language governing rights and
  * limitations under the License.
  * 
- * @APPLE_LICENSE_HEADER_END@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -27,15 +32,24 @@
 #include <servers/bootstrap.h>
 #include <sysexits.h>
 
-#include "globals.h"
-#include "logging.h"
+#include <IOKit/kext/OSKext.h>
+#include "kext_tools_util.h"
+#include "kextd_globals.h"
+#include "kextd_mig_server.h"
 
-/* MiG generated externals and functions */
+/* mig-generated externals and functions */
 extern struct mig_subsystem _kextmanager_subsystem;
 extern boolean_t kextmanager_server(mach_msg_header_t *, mach_msg_header_t *);
 
+extern struct mig_subsystem svc_kextd_kernel_request_subsystem;
+extern boolean_t kextd_kernel_request_server(
+        mach_msg_header_t *InHeadP,
+        mach_msg_header_t *OutHeadP);
+
 uid_t gClientUID = -1;
 
+/*******************************************************************************
+*******************************************************************************/
 boolean_t kextd_demux(
     mach_msg_header_t * request,
     mach_msg_header_t * reply)
@@ -44,53 +58,72 @@ boolean_t kextd_demux(
 
     mach_msg_format_0_trailer_t * trailer;
 
-    /* Feed the request into the ("MiG" generated) server */
-    if (!processed &&
-        (request->msgh_id >= _kextmanager_subsystem.start &&
-         request->msgh_id < _kextmanager_subsystem.end)) {
+   /* Feed the request into the ("MiG" generated) server. We have two
+    * subsystems, one for user-space clients, one for the kernel.
+    */
+    if (!processed) {
+        if (request->msgh_id >= _kextmanager_subsystem.start &&
+            request->msgh_id < _kextmanager_subsystem.end) {
 
-        /*
-         * Get the caller's credentials (eUID/eGID) from the message trailer.
-         */
-        trailer = (mach_msg_security_trailer_t *)((vm_offset_t)request +
-            round_msg(request->msgh_size));
+            /*
+             * Get the caller's credentials (eUID/eGID) from the message trailer.
+             */
+            trailer = (mach_msg_security_trailer_t *)((vm_offset_t)request +
+                round_msg(request->msgh_size));
 
-        if ((trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0) &&
-           (trailer->msgh_trailer_size >= MACH_MSG_TRAILER_FORMAT_0_SIZE)) {
+            if ((trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0) &&
+               (trailer->msgh_trailer_size >= MACH_MSG_TRAILER_FORMAT_0_SIZE)) {
 
-            gClientUID = trailer->msgh_sender.val[0];
-#if 0
-            kextd_log("caller has eUID = %d, eGID = %d",
-                trailer->msgh_sender.val[0],
-                trailer->msgh_sender.val[1]);
-#endif 0
-        } else {
-            kextd_error_log("caller's credentials not available");
-            gClientUID = -1;
+                gClientUID = trailer->msgh_sender.val[0];
 
+                OSKextLog(/* kext */ NULL,
+                    kOSKextLogDebugLevel | kOSKextLogIPCFlag,
+                    "MIG message received: caller has eUID = %d, eGID = %d.",
+                    trailer->msgh_sender.val[0],
+                    trailer->msgh_sender.val[1]);
+
+            } else {
+                OSKextLog(/* kext */ NULL,
+                    kOSKextLogWarningLevel | kOSKextLogIPCFlag,
+                    "Caller's credentials not available.");
+                gClientUID = -1;
+
+            }
+
+           /* Process user task requests.
+            */
+            processed = kextmanager_server(request, reply);
+
+        } else if (request->msgh_id >= svc_kextd_kernel_request_subsystem.start &&
+            request->msgh_id < svc_kextd_kernel_request_subsystem.end) {
+            
+           /* Process kernel requests.
+            */
+            processed = kextd_kernel_request_server(request, reply);
         }
- 
-        /*
-         * Process kextd requests.
-         */
-        processed = kextmanager_server(request, reply);
-    }
-
-    if (!processed &&
-        (request->msgh_id >= MACH_NOTIFY_FIRST &&
-         request->msgh_id < MACH_NOTIFY_LAST)) {
-
-        kextd_error_log("failed to process message");
     }
 
     if (!processed) {
-        kextd_error_log("unknown message received");
+        if (request->msgh_id >= MACH_NOTIFY_FIRST &&
+            request->msgh_id < MACH_NOTIFY_LAST) {
+
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                "Failed to process MIG message.");
+        } else {
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel | kOSKextLogIPCFlag,
+                "Unknown MIG message received.");
+        }
     }
+
+    gClientUID = (uid_t)-1;
 
     return processed;
 }
 
-
+/*******************************************************************************
+*******************************************************************************/
 void kextd_mach_port_callback(
     CFMachPortRef port,
     void *msg,

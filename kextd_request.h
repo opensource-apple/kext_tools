@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2008 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -25,4 +25,16 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-#include <IOKit/kext/kextmanager_mig.defs>
+#ifndef __REQUEST_H__
+#define __REQUEST_H__
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <libc.h>
+
+#include <IOKit/kext/OSKext.h>
+
+#include "kext_tools_util.h"
+
+bool kextd_process_kernel_requests(void);
+
+#endif __REQUEST_H__

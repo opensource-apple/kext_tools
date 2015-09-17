@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2008 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -25,4 +25,17 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-#include <IOKit/kext/kextmanager_mig.defs>
+#ifndef __KEXTD_PERSONALITIES__
+#define __KEXTD_PERSONALITIES__
+
+#include "kext_tools_util.h"
+
+/* This function must be given the array of all kexts opened by
+ * kextd from the system extensions folders. kextd tries to use
+ * cache files for the system extension folders' personalities,
+ * but if it can't use them all, it sends the personalities from
+ * all kexts opened.
+ */
+OSReturn sendPersonalitiesToKernel(void);
+
+#endif /* __KEXTD_PERSONALITIES__ */

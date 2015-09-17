@@ -20,27 +20,26 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#ifndef __PTLOCK_H__
-#define __PTLOCK_H__
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-    
-#include <CoreFoundation/CFBase.h>
-#include <pthread.h>
+#ifndef __COMPRESSION_H__
+#define __COMPRESSION_H__
 
-typedef struct __PTLock * PTLockRef;
+#include <stdlib.h>
 
-PTLockRef  PTLockCreate(void);
-void       PTLockFree(PTLockRef lock);
+u_int32_t local_adler32(
+    u_int8_t * buffer,
+    int32_t    length);
 
-Boolean    PTLockTryLock(PTLockRef lock);
-void       PTLockTakeLock(PTLockRef lock);
-void       PTLockUnlock(PTLockRef lock);
+int decompress_lzss(
+    u_int8_t       * dst,
+    u_int32_t        dstlen,
+    u_int8_t * src,
+    u_int32_t        srclen);
 
-#ifdef __cplusplus
-}
-#endif
-#endif __PTLOCK_H__
+u_int8_t * compress_lzss(
+    u_int8_t       * dst,
+    u_int32_t        dstlen,
+    u_int8_t * src,
+    u_int32_t        srclen);
 
+#endif /* __COMPRESSION_H__ */

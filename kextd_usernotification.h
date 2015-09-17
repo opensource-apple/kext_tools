@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 2008 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
@@ -25,4 +25,26 @@
  * 
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-#include <IOKit/kext/kextmanager_mig.defs>
+#ifndef __KEXTD_USERNOTIFICATION_H__
+#define __KEXTD_USERNOTIFICATION_H__
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <SystemConfiguration/SystemConfiguration.h>
+#include "kextd_main.h"
+
+#ifndef NO_CFUserNotification
+ExitStatus startMonitoringConsoleUser(
+    KextdArgs    * toolArgs,
+    unsigned int * sourcePriority);
+void stopMonitoringConsoleUser(void);
+
+Boolean recordNonsecureKexts(CFArrayRef kextList);
+void    resetUserNotifications(Boolean dismissAlert);
+
+void kextd_raise_notification(
+    CFStringRef alertHeader,
+    CFArrayRef  messageArray);
+
+#endif /* ifndef NO_CFUserNotification */
+
+#endif /* __KEXTD_USERNOTIFICATION_H__ */
