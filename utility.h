@@ -20,27 +20,31 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#ifndef __PTLOCK_H__
-#define __PTLOCK_H__
+#include <libc.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-    
-#include <CoreFoundation/CFBase.h>
-#include <pthread.h>
+#include <IOKit/kext/KXKextManager.h>
 
-typedef struct __PTLock * PTLockRef;
+extern KXKextManagerLogLevel   g_verbose_level;
+extern const char *progname;
 
-PTLockRef  PTLockCreate(void);
-void       PTLockFree(PTLockRef lock);
+CFStringRef createCFString(char * string);
 
-Boolean    PTLockTryLock(PTLockRef lock);
-void       PTLockTakeLock(PTLockRef lock);
-void       PTLockUnlock(PTLockRef lock);
+Boolean check_file(const char * filename);
+Boolean check_dir(const char * dirname, int writeable, int print_err);
+void qerror(const char * format, ...);
+void verbose_log(const char * format, ...);
+void error_log(const char * format, ...);
+int user_approve(int default_answer, const char * format, ...);
+const char * user_input(const char * format, ...);
 
-#ifdef __cplusplus
-}
-#endif
-#endif __PTLOCK_H__
+int addKextsToManager(
+    KXKextManagerRef aManager,
+    CFArrayRef kextNames,
+    CFMutableArrayRef kextArray,
+    Boolean do_tests);
 
+int fork_program(
+    const char * argv0,
+    char * const argv[],
+    int delay,
+    Boolean wait);

@@ -18,8 +18,8 @@
 	<dict>
 	    <key>EFIBooter</key>    <!-- finderinfo[1] -> file -->
 	    <string>/System/Library/CoreServices/boot.efi</string>
-	    <!--key>OFBooter</key>	    <!-- type/creator in finderinfo[0]>
-	    <string>/System/Library/CoreServices/BootX</string-->
+	    <key>OFBooter</key>	    <!-- type/creator in finderinfo[0]-->
+	    <string>/System/Library/CoreServices/BootX</string>
 	</dict>
 
 	<key>PostBootPaths</key>   <!-- in RPS directories known to booter -->

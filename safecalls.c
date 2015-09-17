@@ -1,4 +1,26 @@
 /*
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+/*
  * FILE: safecalls.c
  * AUTH: Soren Spies (sspies)
  * DATE: 16 June 2006 (Copyright Apple Computer, Inc)
@@ -19,6 +41,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <sys/mount.h>
 #include <sys/param.h>	// MAXBSIZE
 #include <sys/stat.h>
 #include <string.h>
@@ -26,6 +49,8 @@
 #include <stdlib.h>	// malloc(3)
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/ucred.h>
+
 
 #include <fts.h>
 
@@ -34,30 +59,69 @@
 #include "logging.h"
 
 #define RESTOREDIR(savedir) do { if (savedir != -1 && restoredir(savedir))  \
-		        	 kextd_error_log("%s: lost CWD!?", __func__); \
+		 kextd_error_log("%s: ALERT: couldn't restore CWD", __func__); \
 		    	    } while(0)
 
-// current checks to make sure on same volume
+// given that we call this function twice on an error path, it is tempting
+// to use getmntinfo(3) but it's not threadsafe ... :P
+static int findmnt(dev_t devid, char mntpt[MNAMELEN])
+{
+    int rval = ELAST + 1;
+    int i, nmnts = getfsstat(NULL, 0, 0);
+    size_t bufsz;
+    struct statfs *mounts = NULL;
+
+    if (nmnts <= 0)	goto finish;
+
+    bufsz = nmnts * sizeof(struct statfs);
+    if (!(mounts = malloc(bufsz)))                  goto finish;
+    if (-1 == getfsstat(mounts, bufsz, MNT_NOWAIT)) goto finish;
+
+    // loop looking for dev_t in the statfs structs
+    for (i = 0; i < nmnts; i++) {
+	struct statfs *sfs = &mounts[i];
+
+	if (sfs->f_fsid.val[0] == devid) {
+	    if (strlcpy(mntpt, sfs->f_mntonname, MNAMELEN) >= MNAMELEN)
+		goto finish;
+	    rval = 0;
+	    break;
+	}
+    }
+
+finish:
+    if (mounts)	    free(mounts);
+    return rval;
+}
+
+// currently checks to make sure on same volume
 // other checks could include:
-// * "really owned by <foo> on root/<foo>-mounted volume"
+// - "really owned by <foo> on root/<foo>-mounted volume"
 static int spolicy(int scopefd, int candfd)
 {
     int bsderr = -1;
-    struct stat dirsb, volsb;
+    struct stat candsb, scopesb;
 
-    if ((bsderr = fstat(candfd, &dirsb)))  goto finish;	    // trusty fstat()
-    if ((bsderr = fstat(scopefd, &volsb)))  goto finish;    // still there?
+    if ((bsderr = fstat(candfd, &candsb)))    goto finish;  // trusty fstat()
+    if ((bsderr = fstat(scopefd, &scopesb)))  goto finish;  // still there?
 
     // simple st_dev policy for now
-    if (volsb.st_dev != dirsb.st_dev) {
-	kextd_error_log("spolicy: ALERT: dev_t mismatch");
-	bsderr = EPERM;
+    if (candsb.st_dev != scopesb.st_dev) {
+	bsderr = -1;
+	errno = EPERM;
+	char scopemnt[MNAMELEN];
+
+	if (findmnt(scopesb.st_dev, scopemnt) == 0) {
+	    kextd_error_log("spolicy: ALERT: object not on volume %s",scopemnt);
+	} else {
+	    kextd_error_log("spolicy: ALERT: dev_t mismatch (%d != %d)",
+			    candsb.st_dev, scopesb.st_dev);
+	}
 	goto finish;
     }
 
 finish:
     return bsderr;
-
 }
 
 
@@ -70,15 +134,22 @@ int schdirparent(int fdvol, const char *path, int *olddir, char child[PATH_MAX])
     if (olddir)	    *olddir = -1;
     if (!path)	    goto finish;
 
-    if (strlcpy(parent, dirname(path), PATH_MAX) >= PATH_MAX)    goto finish;
+    if (strlcpy(parent, path, PATH_MAX) >= PATH_MAX)    goto finish;
+    if (strlcpy(parent, dirname(parent), PATH_MAX) >= PATH_MAX)    goto finish;
 
     // make sure parent is on specified volume
     if (-1 == (dirfd = open(parent, O_RDONLY, 0)))  goto finish;
-    if (spolicy(fdvol, dirfd))	    goto finish;
+    errno = 0;
+    if (spolicy(fdvol, dirfd)) {
+	if (errno == EPERM)
+	    kextd_error_log("policy violation opening %s", parent);
+	goto finish;
+    }
 
     // output parameters
     if (child) {
-	if (strlcpy(child, basename(path), PATH_MAX) >= PATH_MAX)
+	if (strlcpy(child, path, PATH_MAX) >= PATH_MAX)    goto finish;
+	if (strlcpy(child, basename(child), PATH_MAX) >= PATH_MAX)
 	    goto finish;
     }
     if (olddir) {
@@ -99,7 +170,7 @@ finish:
 }
 
 // have to rely on schdirparent so we don't accidentally O_CREAT
-int sopen(int fdvol, char *path, int flags, mode_t mode /*should be '...' */)
+int sopen(int fdvol, const char *path, int flags, mode_t mode /*'...' fancier*/)
 {
     int rfd = -1;
     int candfd = -1;
@@ -201,8 +272,9 @@ int srename(int fdvol, const char *oldpath, const char *newpath)
     char oldname[PATH_MAX];
     char newname[PATH_MAX];
 
-    // calculate netname first since schdirparent uses basename :P
-    if (strlcpy(newname, basename(newpath), PATH_MAX) >= PATH_MAX)goto finish;
+    // calculate netname first since schdirparent uses basename
+    if (strlcpy(newname, newpath, PATH_MAX) >= PATH_MAX)    goto finish;
+    if (strlcpy(newname, basename(newname), PATH_MAX) >= PATH_MAX)goto finish;
     if (schdirparent(fdvol, oldpath, &savedir, oldname))   	goto finish;
 
     bsderr = rename(oldname, newname);
@@ -212,7 +284,7 @@ finish:
     return bsderr;
 }
 
-// stolen with gratitude from TAOcommon's TAOCFURLDelete :)
+// stolen with gratitude from TAOcommon's TAOCFURLDelete
 int sdeepunlink(int fdvol, char *path)
 {
     int             rval = ELAST + 1;
@@ -222,7 +294,7 @@ int sdeepunlink(int fdvol, char *path)
     FTS         *   fts;
     FTSENT      *   fent;
 
-    // opting for security, of course :)
+    // opting for security, of course
     ftsoptions |= FTS_PHYSICAL;		// see symlinks
     ftsoptions |= FTS_XDEV;		// don't cross devices
     ftsoptions |= FTS_NOSTAT;		// fts_info tells us enough
@@ -238,7 +310,7 @@ int sdeepunlink(int fdvol, char *path)
         switch (fent->fts_info) {
             case FTS_DC:        // directory that causes a cycle in the tree
             case FTS_D:         // directory being visited in pre-order
-            case FTS_DOT:       // file named `.' or `..' (not requested :P)
+            case FTS_DOT:       // file named '.' or '..' (not requested)
                 break;
 
             case FTS_DNR:       // directory which cannot be read
@@ -266,7 +338,7 @@ int sdeepunlink(int fdvol, char *path)
 
     // close the iterator now
     if (fts_close(fts) < 0) {
-        kextd_error_log("fts_close failed? - %s", strerror(errno));
+        kextd_error_log("fts_close failed - %s", strerror(errno));
     }
 
 finish:
@@ -294,7 +366,8 @@ int sdeepmkdir(int fdvol, const char *path, mode_t mode)
     } else if (errno != ENOENT) {
 	goto finish;		    // bsderr = -1 -> errno
     } else {
-	if (strlcpy(parent, dirname(path), PATH_MAX) >= PATH_MAX)    goto finish;
+	if (strlcpy(parent, path, PATH_MAX) >= PATH_MAX)    	    goto finish;
+	if (strlcpy(parent, dirname(parent), PATH_MAX) >= PATH_MAX) goto finish;
 
 	// and recurse since it wasn't there
 	if ((bsderr = sdeepmkdir(fdvol, parent, mode)))	    goto finish;
@@ -308,14 +381,14 @@ finish:
 }
 
 #define     min(a,b)        ((a) < (b) ? (a) : (b))
-int scopyfile(int srcfdvol, char *srcpath, int dstfdvol, char *dstpath)
+int scopyfile(int srcfdvol, const char *srcpath, int dstfdvol, const char *dstpath)
 {
     int bsderr = -1;
     int srcfd = -1, dstfd = -1;
     struct stat srcsb;
     char dstparent[PATH_MAX];
     mode_t dirmode;
-    void *buf = NULL;	    // MAXBSIZE on the stack is a bad idea :)
+    void *buf = NULL;	    // MAXBSIZE on the stack is a bad idea
     off_t bytesLeft, thisTime;
 
     // figure out directory mode
@@ -326,7 +399,8 @@ int scopyfile(int srcfdvol, char *srcpath, int dstfdvol, char *dstpath)
     if (dirmode & S_IROTH)	dirmode |= S_IXOTH;
 
     // and recursively create the parent directory
-    if (strlcpy(dstparent, dirname(dstpath), PATH_MAX) >= PATH_MAX) goto finish;
+    if (strlcpy(dstparent, dstpath, PATH_MAX) >= PATH_MAX)    	    goto finish;
+    if (strlcpy(dstparent, dirname(dstparent), PATH_MAX)>=PATH_MAX) goto finish;
     if ((sdeepmkdir(dstfdvol, dstparent, dirmode)))	    goto finish;
 
     // nuke/open the destination

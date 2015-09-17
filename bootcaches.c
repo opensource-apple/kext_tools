@@ -1,5 +1,27 @@
 /*
- * FILE: bootcaches.c [is the correct name!]
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+/*
+ * FILE: bootcaches.c
  * AUTH: Soren Spies (sspies)
  * DATE: "spring" 2006
  * DESC: routines for bootcache data
@@ -7,7 +29,7 @@
  */
 
 #include <bless.h>
-#include <bootfiles.h>		// eventually "new" bootcaches.h
+#include <bootfiles.h>
 #include <IOKit/IOKitLib.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -16,25 +38,26 @@
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/kmod.h>
 
 #include <Kernel/IOKit/IOKitKeysPrivate.h>
 #include <Kernel/libsa/mkext.h>
-#include <DiskArbitration/DiskArbitration.h>	// for UUID fetching :P
-#include <IOKit/kext/kextmanager_types.h>       // DEVMAXPATHSIZE    
+#include <DiskArbitration/DiskArbitration.h>        // for UUID fetching
+#include <DiskArbitration/DiskArbitrationPrivate.h> // path -> DADisk
+#include <IOKit/kext/fat_util.h>
+#include <IOKit/kext/macho_util.h>
+#include <IOKit/kext/kernel_check.h>
 
+#include "bootcaches.h"	    // includes CF
+#include "globals.h"
 #include "logging.h"
-#include "fat_util.h"
-#include "macho_util.h"
 #include "mkext_util.h"
-#include "bootroot.h"	    // includes CF
 #include "safecalls.h"
+#include "utility.h"
 
 
-// XX prototypes for external functions need to be in header files!
-MkextCRCResult getMkextCRC(const char * file_path, uint32_t * crc_ptr);
-char *         copyKernelVersion(const char * kernel_file);
-
-#define NCHARSUUID (2*sizeof(CFUUIDBytes) + 5)	// hex with 4 -'s and one NUL
+static MkextCRCResult getMkextCRC(const char * file_path, uint32_t * crc_ptr);
 
 // X these could take a label/action as their third parameter
 #define pathcpy(dst, src) do { \
@@ -49,11 +72,10 @@ char *         copyKernelVersion(const char * kernel_file);
 ******************************************************************************/
 void destroyCaches(struct bootCaches *caches)
 {
-    if (caches->cachefd != -1)	close(caches->cachefd);
-    if (caches->volUUIDStr)	CFRelease(caches->volUUIDStr);
-    if (caches->cacheinfo)    	CFRelease(caches->cacheinfo);
-    if (caches->miscpaths)  	free(caches->miscpaths);  // free all strings
-    if (caches->rpspaths)	free(caches->rpspaths);
+    if (caches->cachefd != -1)  close(caches->cachefd);
+    if (caches->cacheinfo)      CFRelease(caches->cacheinfo);
+    if (caches->miscpaths)      free(caches->miscpaths);  // free all strings
+    if (caches->rpspaths)       free(caches->rpspaths);
     free(caches);
 }
 
@@ -66,11 +88,11 @@ static void gsub(char old, char new, char *s)
     char *p;
 
     while((p = s++) && *p)
-	if (*p == old)
-	    *p = new;
+        if (*p == old)
+            *p = new;
 }
 
-// fillCachedPath is available for external callers (so no 'static')
+// fillCachedPath not currently used beyond this module, but it is in the header
 int fillCachedPath(cachedPath *cpath, char *uuidchars, char *relpath)
 {
     int rval = ELAST + 1;
@@ -90,59 +112,67 @@ finish:
     return rval;
 }
 
-// wrap the published fillCachedPath with that which we always do
+// wrap fillCachedPath() with the local idiom
 #define str2cachedPath(cpath, caches, relstr) \
 do { \
-    char relpath[PATH_MAX], uuidchars[NCHARSUUID]; \
+    char relpath[PATH_MAX]; \
 \
     if (!CFStringGetFileSystemRepresentation(relstr, relpath, PATH_MAX)) \
-	goto finish; \
-    if(!CFStringGetCString(caches->volUUIDStr, uuidchars, NCHARSUUID, \
-	    kCFStringEncodingASCII)) 	goto finish; \
-    if (fillCachedPath(cpath, uuidchars, relpath))  goto finish; \
+        goto finish; \
+    if (fillCachedPath(cpath, caches->uuid_str, relpath))  goto finish; \
 } while(0)
 
-// dict -> struct bootCaches
-static struct bootCaches*
-parseDict(CFDictionaryRef bcDict, char *rootpath, char **errmsg,
-	CFStringRef volUUIDStr, CFStringRef volName)
+// parse bootcaches.plist and dadisk dictionaries into passed struct
+// caller populates fields it needed to load the plist
+// and properly frees the structure if we fail
+static int
+finishParse(struct bootCaches *caches, CFDictionaryRef bcDict,
+           CFDictionaryRef ddesc, char **errmsg)
 {
-    // for the dictionary
-    struct bootCaches *caches, *rval = NULL;
-    CFDictionaryRef dict;	// don't release
-    CFIndex keyCount;	// track whether we've handled all keys
-    CFStringRef str;
-    // char path[PATH_MAX];
+    int rval = ELAST + 1;
+    CFDictionaryRef dict;   // don't release
+    CFIndex keyCount;       // track whether we've handled all keys
+    CFStringRef str;        // used to point to objects owned by others
+    CFStringRef createdStr = NULL;
+    CFUUIDRef uuid;
 
-    // XX could calloc should be in caller :P:P
-    *errmsg = "allocation failure";	    	
-    caches = calloc(1, sizeof(*caches));
-    if (!caches)  goto finish;
-    caches->cachefd = -1;			// so destroy knows what's up
-    pathcpy(caches->root, rootpath);
-    if (!volUUIDStr)	    goto finish;
-    caches->volUUIDStr = CFRetain(volUUIDStr);
-    if (!CFStringGetFileSystemRepresentation(volName,caches->volname,NAME_MAX))
-	goto finish;
+    *errmsg = "error getting disk metadata";
+    // volume UUID, name, bsdname
+    if (!(uuid = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeUUIDKey)))
+        goto finish;
+    if (!(createdStr = CFUUIDCreateString(nil, uuid)))
+        goto finish;
+     if (!CFStringGetFileSystemRepresentation(createdStr,caches->uuid_str,NCHARSUUID))
+        goto finish;
+
+    if (!(str = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeNameKey)))
+        goto finish;
+    if (!CFStringGetFileSystemRepresentation(str, caches->volname, NAME_MAX))
+        goto finish;
+
+    // bsdname still needed for bless
+    if (!(str = CFDictionaryGetValue(ddesc, kDADiskDescriptionMediaBSDNameKey)))
+        goto finish;
+    if (!CFStringGetFileSystemRepresentation(str, caches->bsdname, NAME_MAX))
+        goto finish;
 
 
-    *errmsg = "unsupported bootcaches data";	// covers most of parseDict()
-
-    keyCount = CFDictionaryGetCount(bcDict);	// start with the top
+    *errmsg = "unsupported bootcaches data";    // covers the rest
+    keyCount = CFDictionaryGetCount(bcDict);    // start with the top
 
     // process keys for paths read "before the booter"
     dict = (CFDictionaryRef)CFDictionaryGetValue(bcDict, kBCPreBootKey);
     if (dict) {
-	CFArrayRef apaths;
-	CFIndex miscindex = 0;
+        CFArrayRef apaths;
+        CFIndex miscindex = 0;
 
-	if (CFGetTypeID(dict) != CFDictionaryGetTypeID())  goto finish;
-	caches->nmisc = CFDictionaryGetCount(dict);	// >= 1 path / key
-	keyCount += CFDictionaryGetCount(dict);
+        if (CFGetTypeID(dict) != CFDictionaryGetTypeID())  goto finish;
+        caches->nmisc = CFDictionaryGetCount(dict);     // >= 1 path / key
+        keyCount += CFDictionaryGetCount(dict);
 
-	// variable-sized member first
-	apaths = (CFArrayRef)CFDictionaryGetValue(dict, kBCAdditionalPathsKey);
-	if (apaths) {
+        // variable-sized member first
+        apaths = (CFArrayRef)CFDictionaryGetValue(dict, kBCAdditionalPathsKey);
+        if (apaths) {
 	    CFIndex acount;
 
 	    if (CFArrayGetTypeID() != CFGetTypeID(apaths))  goto finish;
@@ -175,8 +205,8 @@ parseDict(CFDictionaryRef bcDict, char *rootpath, char **errmsg,
 	    str2cachedPath(&caches->miscpaths[miscindex], caches, str); // macro
 	    caches->label = &caches->miscpaths[miscindex];
 
-	    miscindex++;	    // get ready for the next guy:)
-	    keyCount--;	    // DiskLabel is dealt with
+	    miscindex++;	    // get ready for the next guy
+        keyCount--;	    // DiskLabel is dealt with
 	}
 
 	// add new keys here
@@ -197,15 +227,13 @@ parseDict(CFDictionaryRef bcDict, char *rootpath, char **errmsg,
 	    keyCount--;	    // EFIBooter is dealt with
 	}
 
-	/*
 	str = (CFStringRef)CFDictionaryGetValue(dict, kBCOFBooterKey);
 	if (str) {
 	    if (CFGetTypeID(str) != CFStringGetTypeID())  goto finish;
 	    str2cachedPath(&caches->ofbooter, caches, str);  // macro
 
-	    keyCount--;	    // hard to test BootX right now
+	    keyCount--;	    // BootX, check
 	}
-	*/
 
 	// add new booters here
 	keyCount--;	// booters dict
@@ -290,146 +318,143 @@ parseDict(CFDictionaryRef bcDict, char *rootpath, char **errmsg,
 
 
     if (keyCount) {
-	*errmsg = "unknown (assumed required) keys in bootcaches.plist";
+	*errmsg = "unrecognized bootcaches data; skipping";
     } else {
 	// hooray
 	*errmsg = NULL;
+	rval = 0;
 	caches->cacheinfo = CFRetain(bcDict);	// for archs, etc
-	rval = caches;
     }
 
 finish:
-    if (!rval) { 
-	if (caches)  destroyCaches(caches);	// note close(cfd) in caller
-    }
+    if (createdStr)	CFRelease(createdStr);
 
     return rval;
 }
 
-struct bootCaches* readCaches(char *rootpath)
+struct bootCaches* readCaches(DADiskRef dadisk)
 {
-    struct bootCaches *rval = NULL;
+    struct bootCaches *rval = NULL, *caches = NULL;
     char *errmsg;
     int errnum = 4;	
+    struct stat sb;
+    CFDictionaryRef ddesc = NULL;
+    CFURLRef volURL = NULL;	// owned by dict; don't release
+    int ntries = 0;
+
     char bcpath[PATH_MAX];
-    int cfd = -1;
     void *bcbuf = NULL;
-    struct stat bcsb;
-    CFDictionaryRef bcProps = NULL;
     CFDataRef bcData = NULL;
     CFDictionaryRef bcDict = NULL;
+    char bspath[PATH_MAX];
 
-    struct stat sb;
-    char bsdname[DEVMAXPATHSIZE];
-    DASessionRef dasession = NULL;
-    DADiskRef disk = NULL;
-    CFDictionaryRef ddesc = NULL;
-    CFUUIDRef voluuid;
-    CFStringRef volName, uuidStr = NULL;
-    char bspath[PATH_MAX], uuidchars[NCHARSUUID];
+    errmsg = "allocation failure";	    	
+    caches = calloc(1, sizeof(*caches));
+    if (!caches)    	    goto finish;
+    caches->cachefd = -1;			// set cardinal (fd 0 valid)
+
+    // 'kextcache -U /' needs this retry to work around 5454260
+    // kexd's vol_appeared filters volumes w/o mount points
+    errmsg = "error copying disk description";
+    do {
+        if (!(ddesc = DADiskCopyDescription(dadisk)))         goto finish;
+        if((volURL=CFDictionaryGetValue(ddesc,kDADiskDescriptionVolumePathKey)))
+            break;
+        else
+            sleep(1);
+    } while (++ntries < kKXDiskArbMaxRetries);
+    if (ntries == kKXDiskArbMaxRetries) {
+        kextd_error_log("Disk description missing mount point for %d tries",
+            ntries);
+    } else if (ntries) {
+        kextd_log("WARNING: readCaches got mount point after %d tries", ntries);
+    }
+
+    if (!CFURLGetFileSystemRepresentation(volURL, false, 
+	 (UInt8*)caches->root, PATH_MAX))      goto finish;
 
     errmsg = "error reading " kBootCachesPath;
-    if (strlcpy(bcpath, rootpath, PATH_MAX) >= PATH_MAX)  goto finish;
+    if (strlcpy(bcpath, caches->root, PATH_MAX) >= PATH_MAX)  goto finish;
     if (strlcat(bcpath, kBootCachesPath, PATH_MAX) >= PATH_MAX)  goto finish;
-    if (-1 == (cfd = open(bcpath, O_RDONLY|O_EVTONLY))) {
+    // Sec: cachefd lets us validate data, operations
+    if (-1 == (caches->cachefd = open(bcpath, O_RDONLY|O_EVTONLY))) {
 	if (errno == ENOENT)	errmsg = NULL;
 	goto finish;
     }
-    if (fstat(cfd, &bcsb)) 	goto finish;
 
-    // check the owner and mode (switched from no-fd-avail CF lameness)
-    // since root can see UID 99, we here ignore disrepected volumes
-    // note: 'cp m_k /Volumes/disrespected/' already broken (shouldn't boot)
-    if (bcsb.st_uid!= 0) {
-	if (bcsb.st_uid != 99) {    // avoid spamming the log for ignored owners
-	    errmsg = kBootCachesPath " not owned by root; no rebuilds";
-	} else {
-	    errmsg = NULL;
-	}
+    // check the owner and mode (fstat() to insure it's the same file)
+    // w/Leopard, root can see all the way to the disk; 99 -> truly unknown
+    // note: 'sudo cp mach_kernel /Volumes/disrespected/' should -> error
+    if (fstat(caches->cachefd, &sb))
+	goto finish;
+    if (sb.st_uid!= 0) {
+	// XXX is there a way we can return a specific error for kextcache -u?
+	errmsg = kBootCachesPath " not owned by root; no rebuilds";
 	goto finish;
     }
-    if (bcsb.st_mode & S_IWGRP || bcsb.st_mode & S_IWOTH) {
+    if (sb.st_mode & S_IWGRP || sb.st_mode & S_IWOTH) {
 	errmsg = kBootCachesPath " writable by non-root";
 	goto finish;
     }
 
-    // okay, go ahead and read it
-    if (!(bcbuf = malloc(bcsb.st_size)))  goto finish;
-    if (read(cfd, bcbuf, bcsb.st_size) != bcsb.st_size)  goto finish;
-    if (!(bcData = CFDataCreate(nil, bcbuf, bcsb.st_size)))  goto finish;
+    // read the plist
+    if (!(bcbuf = malloc(sb.st_size)))  goto finish;
+    if (read(caches->cachefd, bcbuf, sb.st_size)!=sb.st_size)  goto finish;
+    if (!(bcData = CFDataCreate(nil, bcbuf, sb.st_size)))  goto finish;
 
     errmsg = kBootCachesPath " doesn't contain a dictionary";
-    // Sec: might want to switch XML parsers (see 4623105)
+    // Sec: see 4623105 & related for an assessment of our XML parsers
     bcDict = (CFDictionaryRef)CFPropertyListCreateFromXMLData(nil,
 		bcData, kCFPropertyListImmutable, NULL);
     if (!bcDict || CFGetTypeID(bcDict)!=CFDictionaryGetTypeID())
 	goto finish; 
 
-    errmsg = "couldn't get volume UUID";
-    // get and stash volume UUID from DA
-    if (!(dasession = DASessionCreate(nil)))		goto finish;
-    if (!(devname_r(bcsb.st_dev,S_IFBLK,bsdname,DEVMAXPATHSIZE))) goto finish;
-    if (!(disk = DADiskCreateFromBSDName(nil, dasession, bsdname))) goto finish;
-    if (!(ddesc = DADiskCopyDescription(disk)))         goto finish;
-    if (!(voluuid=CFDictionaryGetValue(ddesc,kDADiskDescriptionVolumeUUIDKey)))
-        goto finish;
-    if (!(uuidStr = CFUUIDCreateString(nil, voluuid)))  goto finish;
-    if (!(volName=CFDictionaryGetValue(ddesc,kDADiskDescriptionVolumeNameKey)))
-	goto finish;
+    // let finishParse() fill in the rest of the structure
+    if (finishParse(caches, bcDict, ddesc, &errmsg))	goto finish;
 
-    errmsg = "bootstamps cache problem";
-    if (strlcpy(bspath, rootpath, PATH_MAX) >= PATH_MAX)  goto finish;
+    errmsg = "error creating "kTSCacheDir;
+    if (strlcpy(bspath, caches->root, PATH_MAX) >= PATH_MAX)  goto finish;
     if (strlcat(bspath, kTSCacheDir, PATH_MAX) >= PATH_MAX)  goto finish;
-    if(!CFStringGetCString(uuidStr,uuidchars,NCHARSUUID,kCFStringEncodingASCII))
-	goto finish;
-    pathcat(bspath, uuidchars);
-
+    pathcat(bspath, caches->uuid_str);
     if ((errnum = stat(bspath, &sb))) {
 	if (errno == ENOENT) {
-	    // s..mkdir ensures the cache directory is on the volume
-	    if ((errnum = sdeepmkdir(cfd, bspath, kTSCacheMask)))  goto finish;
+	    // s..mkdir ensures the cache directory is on the same volume
+	    if ((errnum = sdeepmkdir(caches->cachefd, bspath, kTSCacheMask)))
+		goto finish;
 	}
 	else
 	    goto finish;
     }
 
-    // and turn the dictionary into a structure (XX messier and messier)
-    rval = parseDict(bcDict, rootpath, &errmsg, uuidStr, volName);
-    if (!rval)  goto finish;
-
-    // pass along goodies from above (XX calloc should have been above)
-    rval->cachefd = cfd;	// Sec: so we can make sure it's valid later
-
-    errmsg = NULL;		// we made it!
+    // success!
+    rval = caches;
+    errmsg = NULL;
 
 finish:
-    if (bcbuf)	    free(bcbuf);
-    if (bcData)     CFRelease(bcData);
-    if (bcProps)    CFRelease(bcProps);
-    if (bcDict)     CFRelease(bcDict);	// retained for struct in parseDict ;p
-    if (ddesc)      CFRelease(ddesc);
-    if (disk)       CFRelease(disk);
-    if (dasession)  CFRelease(dasession);
-
+    // report any error message
     if (errmsg) {
 	if (errnum == -1)
-	    kextd_error_log("%s: %s: %s", rootpath, errmsg, strerror(errno));
+	    kextd_error_log("%s: %s: %s",caches->root,errmsg,strerror(errno));
 	else
-	    kextd_error_log("%s: %s", rootpath, errmsg);
+	    kextd_error_log("%s: %s", caches->root, errmsg);
     }
 
-    if (!rval) {
-	// X should be destroyCaches and calloc should be in this func, etc
-	if (cfd != -1)	close(cfd);
-	if (uuidStr)	CFRelease(uuidStr);
-    }
+    // clean up (unwind in allocation order)
+    if (ddesc)      CFRelease(ddesc);
+    if (bcDict)     CFRelease(bcDict);	// retained for struct by finishParse
+    if (bcData)     CFRelease(bcData);
+    if (bcbuf)      free(bcbuf);
+
+    // if finishParse() failed, clean up our stuff
+    if (!rval)
+	destroyCaches(caches);	    // closes cachefd if needed
 
     return rval;
 }
 
 /*******************************************************************************
 * needsUpdate checks a single path and timestamp; populates path->tstamp
-* X: will we need a way to compare w/tstamp or can we just use the bootstamp?
+* We compare/copy the *ctime* of the source file to the *mtime* of the bootstamp.
 *******************************************************************************/
 int needsUpdate(char *root, cachedPath* cpath, Boolean *outofdate)
 {
@@ -447,7 +472,9 @@ int needsUpdate(char *root, cachedPath* cpath, Boolean *outofdate)
     // stat resolved rpath -> tstamp
     if (stat(fullrp, &rsb)) {
 	if (errno == ENOENT) {
+	    // if the file doesn't exist; it can't be out of date
 	    bsderr = 0;
+	    *outofdate = false;
 	} else {
 	    kextd_error_log("cached file %s: %s", fullrp, strerror(errno));
 	}
@@ -456,14 +483,14 @@ int needsUpdate(char *root, cachedPath* cpath, Boolean *outofdate)
 
     cpath->tstamps[0].tv_sec = rsb.st_atimespec.tv_sec;	    // to apply later
     cpath->tstamps[0].tv_usec = rsb.st_atimespec.tv_nsec / 1000;
-    cpath->tstamps[1].tv_sec = rsb.st_mtimespec.tv_sec;	    // don't ask ;p
-    cpath->tstamps[1].tv_usec = rsb.st_mtimespec.tv_nsec / 1000;
+    cpath->tstamps[1].tv_sec = rsb.st_ctimespec.tv_sec;	    // don't ask ;p
+    cpath->tstamps[1].tv_usec = rsb.st_ctimespec.tv_nsec / 1000;
 
     // stat tspath
     // and compare as appropriate
     if (stat(fulltsp, &tsb) == 0) {
-	ood = (tsb.st_mtimespec.tv_sec != rsb.st_mtimespec.tv_sec ||
-	       tsb.st_mtimespec.tv_nsec != tsb.st_mtimespec.tv_nsec);
+	ood = (tsb.st_mtimespec.tv_sec != rsb.st_ctimespec.tv_sec ||
+	       tsb.st_mtimespec.tv_nsec != rsb.st_ctimespec.tv_nsec);
     } else {
 	if (errno == ENOENT) {
 	    ood = true;	// nothing to compare with
@@ -514,7 +541,7 @@ int needUpdates(struct bootCaches *caches, Boolean *any,
     for (cp = caches->miscpaths; cp < &caches->miscpaths[caches->nmisc]; cp++){
 	(void)needsUpdate(caches->root, cp, &needsUp);
 	// could emit warnings in an appropriate verbose mode
-	// no one cares if .VolumeIcon.icns is missing :)
+	// no one cares if .VolumeIcon.icns is missing
 	// though evidently (4487046) the label file is important
 	if (needsUp)				    anyOOD = miscOOD = true;
     }
@@ -576,68 +603,9 @@ int applyStamps(struct bootCaches *caches)
     return rval;
 }
 
-/******************************************************************************
- * fork_kextcache lauches kc with the given (null-terminated) argv
- * - in child, set TMPDIR to volume's kTSCacheDir (we created it earlier)
- * - uses double-fork()/exec to avoid a zombie :P
- * - logs own errors
- *****************************************************************************/
-int fork_kextcache(char *cacheRoot, char *argv[], Boolean wait)       
-{
-    int rval = -2;
-    int status;
-    pid_t pid;
-    char tmpdir[PATH_MAX];
-
-    if (strlcpy(tmpdir, cacheRoot, PATH_MAX) >= PATH_MAX)  goto finish; 
-    // if we can't append kTSCacheDir, we'll accept using volume's root ;p
-    strlcat(tmpdir, kTSCacheDir, PATH_MAX);
-
-    switch (pid = fork()) {
-        case -1:
-            rval = pid;
-            goto finish;
-
-        case 0:  // child
-            // give these children to the system (grr, linker-fork() in kextlib)
-	    setenv("TMPDIR", tmpdir, 1);	// workaround
-
-	    if (!wait) {
-		if (-1 == (rval = daemon(0, 0)))   goto finish;
-	    }
-		
-	    rval = execv("/usr/sbin/kextcache", argv);
-
-            // if execv returns, we have an error (re-open log in child)
-            kextd_openlog("kextd");
-            kextd_error_log("couldn't launch kextcache! - %s", strerror(errno));
-            exit(1);
-            break;      // really shouldn't get here :)
-
-        default:  // parent
-            // kextd_log("DEBUG: launched kextcache w/pid %d", pid);
-            waitpid(pid, &status, 0);
-            status = WEXITSTATUS(status);
-	    if (wait) {
-		rval = status;
-	    } else if (status) {
-		    rval = -1;
-		} else {
-		    rval = pid;
-		}
-
-            break;
-    }
-
-finish:
-    if (rval == -1)
-        kextd_error_log("couldn't fork kextcache!");
-
-    return rval;
-}
-
 /*******************************************************************************
 * rebuild_mkext fires off kextcache on the given volume
+* XX there is a bug here that can mask a stale mkext in the Apple_Boot (4764605)
 *******************************************************************************/
 int rebuild_mkext(struct bootCaches *caches, Boolean wait)
 {   
@@ -646,7 +614,7 @@ int rebuild_mkext(struct bootCaches *caches, Boolean wait)
     CFIndex i, argi = 0, argc = 0, narchs = 0;
     CFDictionaryRef pbDict, mkDict;
     CFArrayRef archArray;
-    char **kcargs = NULL, **archstrs = NULL;    // no [ARCH_MAX] anywhere? :P
+    char **kcargs = NULL, **archstrs = NULL;    // no [ARCH_MAX] anywhere?
     char fullmkextp[PATH_MAX], fullextsp[PATH_MAX];
 
     pbDict = CFDictionaryGetValue(caches->cacheinfo, kBCPostBootKey);
@@ -702,7 +670,14 @@ int rebuild_mkext(struct bootCaches *caches, Boolean wait)
     kcargs[argi] = NULL;
 
     rval = 0;
-    pid = fork_kextcache(caches->root, kcargs, wait);  // logs its own errors
+
+   /* wait:false means the return value is <0 for fork/exec failures and
+    * the pid of the forked process if >0.
+    *
+    * wait:true means the return value is <0 for fork/exec failures and
+    * the exit status of the forked process (>=0) otherwise.
+    */
+    pid = fork_program("/usr/sbin/kextcache", kcargs, 0 /* delay */, wait);  // logs its own errors
 
 finish:
     if (rval) 	kextd_error_log("data error before mkext rebuild");
@@ -711,13 +686,43 @@ finish:
 
     if (archstrs) {
         for (i = 0; i < narchs; i++) {
-            if (archstrs[i])  free(archstrs[i]);
+            if (archstrs[i])  	free(archstrs[i]);
         }
         free(archstrs);
     }
-    if (kcargs) free(kcargs);
+    if (kcargs)	    free(kcargs);
 
     return rval;
+}
+
+Boolean check_plist_cache(struct bootCaches *caches)
+{   
+    Boolean needsrebuild = false;
+    struct stat sb;
+    struct stat extsb;
+    char fullplistcachep[PATH_MAX], fullextsp[PATH_MAX];
+
+    // struct bootCaches paths are all *relative*
+    pathcpy(fullplistcachep, caches->root);
+    pathcat(fullplistcachep, caches->exts);
+    pathcat(fullplistcachep, "/Caches/com.apple.kext.info");
+    pathcpy(fullextsp, caches->root);
+    pathcat(fullextsp, caches->exts);
+
+    if (stat(fullextsp, &extsb) == -1) {
+        kextd_log("WARNING: %s: %s", caches->exts, strerror(errno));
+        // assert(needsrebuild == false);   // we can't build w/o exts
+        goto finish;
+    }
+
+    // plist cache
+    needsrebuild = true;  // since this stat() will fail if plist cache gone
+    if (stat(fullplistcachep, &sb) == -1)
+        goto finish;
+    needsrebuild = (sb.st_mtime != extsb.st_mtime + 1);
+
+finish:
+    return needsrebuild;
 }
 
 Boolean check_mkext(struct bootCaches *caches)
@@ -737,8 +742,7 @@ Boolean check_mkext(struct bootCaches *caches)
         struct stat extsb;
 
         if (stat(fullextsp, &extsb) == -1) {
-            kextd_log("couldn't stat %s: %s", caches->exts,
-                strerror(errno));
+            kextd_log("WARNING: %s: %s", caches->exts, strerror(errno));
             // assert(needsrebuild == false);   // we can't build w/o exts
             goto finish;
         }
@@ -755,32 +759,118 @@ finish:
 }
 
 /*******************************************************************************
-* isBootRoot lets you know if a volume has boot partitions and if it's on EFI
+* createDiskForMount creates a DADisk object given a mount point
+* session is optional; one is created and released if the caller can't supply
 *******************************************************************************/
-Boolean isBootRoot(char *volroot, Boolean *isGPT)
+DADiskRef createDiskForMount(DASessionRef session, const char *mount)
 {
-    char bsdname[DEVMAXPATHSIZE];
-    struct stat sb;  
+    DADiskRef rval = NULL;
+    DASessionRef dasession = NULL;
+    CFURLRef volURL = NULL;
+
+    if (session) {
+	dasession = session;
+    } else {
+	dasession = DASessionCreate(nil);
+	if (!dasession)     goto finish;
+    }
+
+    volURL = CFURLCreateFromFileSystemRepresentation(nil, (UInt8*)mount,
+            strlen(mount), 1 /*isDirectory*/);
+    if (!volURL)        goto finish;
+
+    rval = DADiskCreateFromVolumePath(nil, dasession, volURL);
+
+finish:
+    if (volURL)	    CFRelease(volURL);
+    if (!session && dasession)
+	CFRelease(dasession);
+
+    return rval;
+}
+
+/*******************************************************************************
+* hasBoots lets you know if a volume has boot partitions and if it's on GPT
+*******************************************************************************/
+Boolean hasBoots(char *bsdname, CFArrayRef *auxPartsCopy, Boolean *isGPT)
+{
     CFDictionaryRef binfo = NULL;
     Boolean rval = false, gpt = false;
+    int err;
     CFArrayRef ar;
+    char * errmsg = NULL;
+    char stack_bsdname[DEVMAXPATHSIZE];
+    char * lookup_bsdname = bsdname;
+    CFArrayRef dataPartitions = NULL; // do not release;
+    char fulldevname[MAXPATHLEN];
+    char parentdevname[MAXPATHLEN];
+    uint32_t partitionNum;
+    BLPartitionType partitionType;
 
-    // if not BootRoot, we don't bother with kextcache -u    
-    if (stat(volroot, &sb))                                         goto finish;
-    if (!devname_r(sb.st_dev, S_IFBLK, bsdname, DEVMAXPATHSIZE))    goto finish;
+   /* Get the BL info about partitions & such.
+    */
     if (BLCreateBooterInformationDictionary(NULL,bsdname,&binfo))   goto finish;
 
+   /*****
+    * Now, for a GPT check, use one of the data partitions given by the above
+    * call to BLCreateBooterInformationDictionary().
+    */
+    dataPartitions = CFDictionaryGetValue(binfo, kBLDataPartitionsKey);
+    if (dataPartitions && CFArrayGetCount(dataPartitions)) {
+        CFStringRef dpBsdName = CFArrayGetValueAtIndex(dataPartitions, 0);
+
+        if (dpBsdName) {
+            errmsg = "string conversion failure for bsdname";
+             // I hate CFString
+            if (!CFStringGetCString(dpBsdName, stack_bsdname,
+                sizeof(stack_bsdname), kCFStringEncodingUTF8)) {
+                goto finish;
+            }
+            
+            lookup_bsdname = stack_bsdname;
+        }
+    }
+    
+   /* Get the BL info about the partition type (that's all we use, but
+    * we have to pass in valid buffer pointers for all the rest).
+    */
+    errmsg = "internal error";
+    if (sizeof(fulldevname) <= snprintf(fulldevname, sizeof(fulldevname),
+        "/dev/%s", lookup_bsdname)) {
+
+        goto finish;
+    }
+
+    errmsg = "can't get partition type";
+    if (err = BLGetParentDeviceAndPartitionType(NULL /* context */,
+        fulldevname, parentdevname, &partitionNum, &partitionType)) {
+        goto finish;
+    }
+    if (partitionType == kBLPartitionType_GPT) {
+        gpt = true;
+    }
+
+    errmsg = "can't get helper partitions";
+    // check for helper partitions
     ar = CFDictionaryGetValue(binfo, kBLAuxiliaryPartitionsKey);   
     rval = (ar && CFArrayGetCount(ar) > 0);
-    ar = CFDictionaryGetValue(binfo, kBLSystemPartitionsKey);
-    gpt = (ar && CFArrayGetCount(ar) > 0);
+    if (auxPartsCopy)
+        *auxPartsCopy = CFRetain(ar);
 
+    errmsg = NULL;
+    
 finish:
     if (binfo)      CFRelease(binfo);
 
     if (isGPT)      *isGPT = gpt;
+
+    if (errmsg) {
+        kextd_error_log(errmsg);
+    }
+
     return rval;
 }
+
 /*******************************************************************************
 *
 *******************************************************************************/
@@ -809,33 +899,6 @@ Boolean bootedFromDifferentMkext(void)
     }
 
 finish:
-    return result;
-}
-
-/*******************************************************************************
-*
-*******************************************************************************/
-Boolean bootedFromDifferentKernel(void)
-{
-    Boolean result = true;
-    char * runningVersion = NULL;  // must free
-    char * onDiskVersion = NULL;   // must free
-
-    runningVersion = copyKernelVersion(NULL);
-    onDiskVersion  = copyKernelVersion("/mach_kernel");
-
-    if (!runningVersion || !onDiskVersion) {
-        goto finish;
-    }
-
-    if (0 == strcmp(runningVersion, onDiskVersion)) {
-        result = false;
-        goto finish;
-    }
-
-finish:
-    if (runningVersion) free(runningVersion);
-    if (onDiskVersion)  free(onDiskVersion);
     return result;
 }
 
@@ -907,94 +970,16 @@ MkextCRCResult getMkextCRC(const char * file_path, uint32_t * crc_ptr)
     result = kMkextCRCFound;
 
 finish:
-    if (ioRegRoot) IOObjectRelease(ioRegRoot);
-    if (dataObj)   CFRelease(dataObj);
-    return result;
-}
-
-/*******************************************************************************
-* copyKernelVersion()
-*
-* Get the version string for a kernel. If kernel_filename is NULL, get the
-* version of the running kernel via sysctl(); otherwise read it out of the
-* mach-o file.
-*
-* The caller owns the pointer returned. For the sysctl(), we have to allocate a
-* buffer; for reading from a mach-o file, which we unmap, we have to strdup()
-* the found value.
-*******************************************************************************/
-#define KERNEL_VERSION_SYMBOL  "_version"
-
-char * copyKernelVersion(const char * kernel_filename)
-{
-    char * result = NULL;
-    fat_iterator iter = NULL;
-
-    if (!kernel_filename) {
-
-        size_t vers_length;
-        int vers_mib_name[] = { CTL_KERN, KERN_VERSION };
-
-       /* Get the size of the buffer we need to allocate.
-        */
-        if (sysctl(vers_mib_name, sizeof(vers_mib_name) / sizeof(int), NULL,
-            &vers_length, NULL, 0) != 0) {
-
-            kextd_error_log("sysctl for kernel version failed");
-            goto finish;
-        }
-
-        result = malloc(vers_length * sizeof(char));
-        if (result == NULL) {
-            kextd_error_log("malloc failed");
-            goto finish;
-        }
-
-       /* Now actually get the kernel version.
-        */
-        if (sysctl(vers_mib_name, sizeof(vers_mib_name) / sizeof(int), result,
-            &vers_length, NULL, 0) != 0) {
-
-            kextd_error_log("sysctl for kernel version failed");
-            goto finish;
-        }
-
-    } else {
-        struct mach_header * kernel_file = NULL;
-        void * kernel_file_end = NULL;
-        macho_seek_result sym_result;
-
-        iter = fat_iterator_open(kernel_filename, 1);
-        if (!iter) {
-            goto finish;
-        }
-        kernel_file = (struct mach_header *)fat_iterator_find_host_arch(
-            iter, &kernel_file_end);
-        if (!kernel_file) {
-            goto finish;
-        }
-        sym_result = macho_find_symbol(
-            kernel_file, kernel_file_end,
-            KERNEL_VERSION_SYMBOL, (const void **)&result);
-        if (sym_result != macho_seek_result_found) {
-            goto finish;
-        }
-
-        if (result) {
-            result = strdup(result);
-        }
-    }
-
-finish:
-    if (iter) fat_iterator_close(iter);
-
+    if (ioRegRoot)  IOObjectRelease(ioRegRoot);
+    if (dataObj)    CFRelease(dataObj);
+    if (iter)	    fat_iterator_close(iter);
     return result;
 }
 
 void _daDone(DADiskRef disk, DADissenterRef dissenter, void *ctx)
 {
     if (dissenter)
-	CFRetain(dissenter);
+        CFRetain(dissenter);
     *(DADissenterRef*)ctx = dissenter;
     CFRunLoopStop(CFRunLoopGetCurrent());   // assumed okay even if not running
 }

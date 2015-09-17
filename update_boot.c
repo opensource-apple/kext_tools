@@ -1,4 +1,26 @@
 /*
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+/*
  * FILE: update_boot.c
  * AUTH: Soren Spies (sspies)
  * DATE: 8 June 2006
@@ -14,69 +36,95 @@
 #include <sys/mount.h>
 #include <sys/xattr.h>
 #include <unistd.h>
-#include <IOKit/kext/kextmanager_types.h>	// DEVMAXPATHSIZE
+#include <IOKit/kext/kextmanager_types.h>
 
+#include <bootfiles.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
+#include <DiskArbitration/DiskArbitrationPrivate.h>
 
-#include "bootroot.h"	    // eventually "bootcaches.h" (v2)
-#include "bootfiles.h"
+#include "bootcaches.h"
 #include "logging.h"
 #include "safecalls.h"
 #include "update_boot.h"
+#include "utility.h"        // g_verbose_level
 
 enum bootReversions {
     nothingSerious = 0,
-    nukedLabels,	    // 1
-    copyingOFBooter,	    // 2
-    copyingEFIBooter,	    // 3
-    copiedBooters,	    // 4
-    activatingOFBooter,	    // 5
+    noLabels,               // 1
+    copyingOFBooter,        // 2
+    copyingEFIBooter,       // 3
+    copiedBooters,          // 4
+    activatingOFBooter,     // 5
     activatingEFIBooter,    // 6
-    activatedBooters	    // 7
+    activatedBooters        // 7
 };
+
+const char * bootReversionsStrings[] = {
+    NULL,           // unused
+    "Labels deleted",
+    "Unlinking and copying BootX booter",
+    "Unlinking and copying EFI booter",
+    "Booters copied",
+    "Activating BootX",
+    "Activating EFI booter",
+    "Booters activated"
+};
+
+#define COMPILE_TIME_ASSERT(pred) switch(0){case 0:case pred:;}
 
 // for non-RPS content, including booters
 #define OLDEXT ".old"
 #define NEWEXT ".new"
 #define CONTENTEXT ".contentDetails"
 
+// NOTE: These strings must be the same length, or code in ucopyRPS will break!
+// There is a compile time assert in the function to this effect.
+#define BOOTPLIST_NAME "com.apple.Boot.plist"
+#define BOOTPLIST_APM_NAME "com.apple.boot.plist"
+
 // for Apple_Boot update
 struct updatingVol {
-    int curbootfd;			// Sec: handle to curBoot
-    char curMount[MNAMELEN];		// path to current boot mountpt
-    DADiskRef curBoot;			// and matching diskarb ref
-    char curRPS[PATH_MAX];		// RPS dir inside
-    char efidst[PATH_MAX], ofdst[PATH_MAX];
-    enum bootReversions changestate;	// changes that might need rollback
+    struct bootCaches *caches;          // parsed bootcaches.plist data
+    Boolean doRPS, doMisc, doBooters;   // what needs updating
+    Boolean expectUpToDate;             // expecting things to be right (-U)
+    enum bootReversions changestate;    // track changes for rolling back
+    CFArrayRef boots;                   // BSD Names of Apple_Boot partitions
+    DASessionRef dasession;             // handle to diskarb
 
-    Boolean doRPS, doMisc, doBooters;	// what are we updating
-    CFArrayRef boots;			// bsdname's of Apple_Boot partitions
-    DASessionRef dasession;		// handle to diskarb
-    struct bootCaches *caches;		// parsed bootcaches.plist data
+    // changed for each Apple_Boot
+    int bootIdx;                        // which helper are we updating
+    char bsdname[DEVMAXPATHSIZE];       // bsdname of Apple_Boot
+    DADiskRef curBoot;                  // and matching diskarb ref
+    char curMount[MNAMELEN];            // path to current boot mountpt
+    int curbootfd;                      // Sec: handle to curMount
+    char curRPS[PATH_MAX];              // RPS dir inside
+    char efidst[PATH_MAX], ofdst[PATH_MAX];
+    Boolean isGPT;
 };
 
 // diskarb
-static int mountBoot(struct updatingVol *up, CFIndex bootindex);
+static int mountBoot(struct updatingVol *up);
 static int unmountBoot(struct updatingVol *up);
 
 // ucopy = unlink & copy
 // no race for RPS, so install it first
-static int ucopyRPS(struct updatingVol *s);	    // nuke/copy to inactive
+static int ucopyRPS(struct updatingVol *s);  // nuke/copy to inactive
 // labels (e.g.) have no fallback, .new is harmless
 // XX ucopy"Preboot/Firmware"
 static int ucopyMisc(struct updatingVol *s);	    // use/overwrite .new names
 // booters have fallback paths, but originals might be broken
 static int ucopyBooters(struct updatingVol *s);     // nuke/copy booters (inact)
 // no label -> hint of indeterminate state (label key in plist?)
+static int moveLabels(struct updatingVol *s);	    // move aside
 static int nukeLabels(struct updatingVol *s);	    // byebye (all?)
 // booters have worst critical:fragile ratio (point of departure)
 static int activateBooters(struct updatingVol *s);  // bless new names
 // and the RPS data needed for booting
-static int activateRPS(struct updatingVol *s);	    // leap-frog w/rename() :)
+static int activateRPS(struct updatingVol *s);	    // leap-frog w/rename()
 // finally, the labels (indicating a working system)
 // XX activate"FirmwarePaths/postboot"
-static int activateMisc(struct updatingVol *s, int bidx); // rename .new / label
+static int activateMisc(struct updatingVol *s);     // rename .new / label
 // and now that we're safe
 static int nukeFallbacks(struct updatingVol *s);
 
@@ -88,11 +136,11 @@ static int revertState(struct updatingVol *up);
  * #1 we only pay attention to root-owned bootcaches.plist files
  * #2 we get an fd to the bootcaches.plist		[trust is here]
 // * #3 we validate the bc.plist fd after getting an fd to the volume's root
- * #4 we use cachefd to generate the bsdname for libbless
+ * #4 we use stored bsdname for libbless
  * #5 we validate cachefd after the call to bless	[trust -> bsdname]
  * #6 we get curbootfd after each apple_boot mount
  * #7 we validate cachefd after the call		[trust -> curfd]
- * #8 all operations on take an fd limiting them to volume scope
+ * #8 operations take an fd limiting their scope to the mount
  */
 
 // ? do these *need* do { } while() wrappers?
@@ -109,141 +157,216 @@ static int revertState(struct updatingVol *up);
 				    pathcat(path, rpath); \
 				} while(0)
 
+// XX there is overlap between errno values and sysexits
+static int getExitValueFor(errval)
+{
+    int rval;
+
+    switch (errval) {
+	case ELAST + 1:
+	    rval = EX_SOFTWARE;
+	    break;
+	case EPERM:
+	    rval = EX_NOPERM;
+	    break;
+	case EAGAIN:
+	case ENOLCK:
+	    rval = EX_OSERR;
+	    break;
+	case -1:
+	    switch (errno) {
+		case EIO:
+		    rval = EX_IOERR;
+		    break;
+		default:
+		    rval = EX_OSERR;
+		    break;
+	    }
+	    break;
+	default:
+	    rval = errval;
+    }
+
+    return rval;
+}
+
 /*******************************************************************************
 * updateBoots will lock the volume and update the booter partitions 
 * Sec: must ensure each target is one of the source's Apple_Boot partitions
 *******************************************************************************/
 int updateBoots(char *volRoot, int filec, const char *files[],
-		       Boolean force, int dashv)
+		       Boolean force, Boolean expectUpToDate)
 {
-    int rval;
-    char *errmsg = NULL;
-    struct updatingVol up = { -1, { '\0' }, };
-    char bsdname[DEVMAXPATHSIZE];
-    CFDictionaryRef bdict = NULL;
-    struct stat cachesb;
+    int rval = ELAST + 1;
+    char *errmsg;
+    struct updatingVol up = { NULL, };
+    up.curbootfd = -1;
+    struct stat sb;
 
-    CFIndex i, bootcount, bootupdates = 0;
+    CFURLRef volURL = NULL;
+    DADiskRef dadisk = NULL;
+    CFIndex bootcount, bootupdates = 0;
     Boolean doAny;
 
-    // if no bootcaches.plist, we don't care about this volume
-    rval = 0;
-    if (takeVolumeForPaths(volRoot, filec, files))  goto finish;  // -u owners
-    up.caches = readCaches(volRoot);
-    if (!up.caches)  goto finish;
+    errmsg = "error getting description from Disk Arbitration";
+    up.dasession = DASessionCreate(nil);
+    if (!up.dasession)	    goto finish;
+    volURL = CFURLCreateFromFileSystemRepresentation(nil, (UInt8*)volRoot,
+		strlen(volRoot) + 1, true /*isDir*/);
+    if (!volURL)    	    goto finish;
+    dadisk = DADiskCreateFromVolumePath(nil, up.dasession, volURL);
+    if (!dadisk)    	    goto finish;
 
-    /* XX Sec reviewed: how we secure against replacing /'s mkext from external
-     * TMPDIR set to target volume
-     * final rename must be on whatever volume provided the kexts
-     * if volume is /, then kexts owned by root can be trusted (4623559 fstat)
-     * otherwise, rename from wrong volume will fail
-     *  
-     * Either rename() will fail or kexts should be safe via root :!
+    // first check for usable bootcaches.plist, else politely bail
+    errmsg = NULL;  // locking, readCaches log their own errors
+    if (!(up.caches = readCaches(dadisk))) {
+	if (g_verbose_level)
+	    kextd_log("%s: no "kBootCachesPath"; nothing to do", volRoot);
+	rval = 0;
+	goto finish;
+    }
+
+    // don't need lock/owners enabled in Leopard to *read* bootcaches.plist
+    // but we do want it before checking the mkext (which may be being rebuilt)!
+    // kextcache -U doesn't lock and kextd holds off on rebuilds for 60 seconds
+    if (!expectUpToDate) {
+	if (takeVolumeForPaths(volRoot, filec, files))  // lock (logs)
+	    goto finish;  
+    } else if (getppid() != 2 /* launchctl */) { 
+	kextd_log("WARNING: no locks preventing kextd-triggered updates");
+    }
+
+    /* XX Sec reviewed: how we secure against replacing /'s mkext from external:
+     * - mktmp/mkstmp used to create temp file at destination
+     * - final rename must be on whatever volume provided the kexts
+     * - if volume is /, then kexts owned by root can be trusted (4623559 fstat)
+     * - otherwise, rename from wrong volume will fail
      */
-    // check mkext for no-kextd case
-    rval = ELAST + 1;
-    errmsg = "couldn't rebuild stale mkext?";	    // XX redundant
     if (check_mkext(up.caches)) {
-	// give up the lock so child can get it (EX_TEMPFAIL == "no status")
-	putVolumeForPath(volRoot, EX_TEMPFAIL);
-	// rebuild the mkext
-	if (rebuild_mkext(up.caches, true /*wait*/))  goto finish;
-	// retake the lock
-	errmsg = NULL;	// takeVolume.. logs its own errors
-	if (takeVolumeForPaths(volRoot, filec, files))  goto finish;
+        // rebuild the mkext under our lock / lack thereof (-v not passed)
+        if (g_verbose_level > 2)
+	    kextd_log("Rebuilding out-of-date mkext");
+	setenv("_com_apple_kextd_skiplocks", "1", 1);	    // no locks, child!
+        if (rebuild_mkext(up.caches, true /*wait*/) != 0)
+	    goto finish;
     }
 
-    // call bless to get booter info (shouldn't access the disk; most common)
+    // hasBoots gets helpers from bless, GPT info from the registry
     errmsg = "couldn't get Apple_Boot information";
-    if (fstat(up.caches->cachefd, &cachesb))  goto finish;	// get data
-    if (!(devname_r(cachesb.st_dev,S_IFBLK,bsdname,DEVMAXPATHSIZE)))goto finish;
-    if (BLCreateBooterInformationDictionary(NULL, bsdname, &bdict))
-	goto finish;
-    if (fstat(up.caches->cachefd, &cachesb))  goto finish;	// boots good?
+    if (!hasBoots(up.caches->bsdname, &up.boots, &up.isGPT)) {
+        rval = 0;	// no boots -> nothing to do; byebye
+        if (g_verbose_level > 0)
+	    kextd_log("%s: no helper partitions to update", volRoot);
+        goto finish;
+    }
 
-    up.boots = CFDictionaryGetValue(bdict, kBLAuxiliaryPartitionsKey);
-    if (!up.boots)  goto finish;	    // no Apple_Boots -> empty array
-    bootcount = CFArrayGetCount(up.boots);
-    if (!bootcount) {
-	rval = 0;	// no boots -> nothing to do; byebye
-	if (dashv > 0)	kextd_log("no helper partitions; skipping update");
+    if (fstat(up.caches->cachefd, &sb))     	// validate plist -> helpers
+	goto finish;
+
+    // 5158091: ignore Inca systems on non-GPT
+    if (!up.isGPT && up.caches->ofbooter.rpath[0] == '\0') {
+	rval = 0;
+	if (g_verbose_level > 0)
+	    kextd_log("%s only supports GPT-based helper partitions", volRoot);
 	goto finish;
     }
 
-
-    // Actually have boot partitions
+    // Have boot partitions and want to update them
     errmsg = "trouble analyzing what needs updating";
     // needUpdates populates our timestamp values for applyStamps
     if (needUpdates(up.caches, &doAny, &up.doRPS, &up.doBooters, &up.doMisc))
 	goto finish;
     if (!doAny && !force) {
-	rval = 0;
-	if (dashv > 0)	kextd_log("helper partitions appear up to date");
-	goto finish;
+        rval = 0;
+        if (g_verbose_level > 0)
+	    kextd_log("%s: helper partitions appear up to date", volRoot);
+        goto finish;
     }
     if (force)	up.doRPS = up.doBooters = up.doMisc = true;
+    up.expectUpToDate = expectUpToDate;
 
-    // Begin work on actual update :)	    [updateBoots vs. checkUpdateBoots?]
-    errmsg = "trouble setting up DiskArb";
-    if (!(up.dasession = DASessionCreate(nil)))  goto finish;
+    // Begin work on actual update	    [updateBoots vs. checkUpdateBoots?]
+    errmsg = "trouble updating one or more helper partitions";
+
+    // mountBoot and unmountBoot will spin the runloop for this DA session
     DASessionScheduleWithRunLoop(up.dasession, CFRunLoopGetCurrent(),
 	    kCFRunLoopDefaultMode);
-
-    errmsg = "trouble updating one or more helper partitions";
-    for (i = 0; i < bootcount; i++) {
-	up.changestate = nothingSerious;		// init state
-	if ((mountBoot(&up, i)))	goto bootfail; 	// sets curMount
-	if (up.doRPS && ucopyRPS(&up))  goto bootfail;	// -> inactive
-	if (up.doMisc) 	    	(void) ucopyMisc(&up);	// -> .new files
-
-	if (nukeLabels(&up)) 		goto bootfail;  // always
-
-	if (up.doBooters && ucopyBooters(&up))	        // .old still active
-	    goto bootfail;
-	if (up.doBooters && activateBooters(&up))	// oh boy
-	    goto bootfail;
-	// new booters remain mostly compatible with old kernels (power outage!)
-	if (up.doRPS && activateRPS(&up))	  	// mv to safety
-	    goto bootfail;
-	if (activateMisc(&up, i))	goto bootfail;	// reverts label
-
-	up.changestate = nothingSerious;
-	bootupdates++;	    // loop success
-	if (dashv > 1) {
-	    kextd_log("successfully updated helper partition #%d", i);
-	}
-
+    bootcount = CFArrayGetCount(up.boots);
+    for (up.bootIdx = 0; up.bootIdx < bootcount; up.bootIdx++) {
+        up.changestate = nothingSerious;		// init state
+        if ((mountBoot(&up)))           goto bootfail;  // sets curMount
+        if (up.doRPS && ucopyRPS(&up))  goto bootfail;  // -> inactive
+        if (up.doMisc)          (void) ucopyMisc(&up);  // -> .new files
+        
+        // get the labels out of the way (should be optional?)
+        if (expectUpToDate) {
+            if (moveLabels(&up))        goto bootfail;  
+        } else {
+            if (nukeLabels(&up))        goto bootfail;
+        }
+        
+        if (up.doBooters && ucopyBooters(&up))	        // .old still active
+            goto bootfail;
+        if (up.doBooters && activateBooters(&up))	// oh boy
+            goto bootfail;
+        // new booters remain mostly compatible with old kernels (power outage!)
+        if (up.doRPS && activateRPS(&up))	  	// mv to safety
+            goto bootfail;
+        if (activateMisc(&up))
+	    goto bootfail;	// reverts label
+        
+        up.changestate = nothingSerious;
+        bootupdates++;	    // loop success
+        if (g_verbose_level > 0) {
+            kextd_log("Successfully updated helper partition %s", up.bsdname);
+        }
+        
 bootfail:
-	if (dashv > 0 && up.changestate != nothingSerious) {
-	    kextd_error_log("error updating helper partition #%d, state %d", i,
-			    up.changestate);
-	}
-	// unroll any changes we may have made
-	(void)revertState(&up);	    // smart enough to do nothing :)
-
-	// always unmount
-	if (nukeFallbacks(&up))	kextd_error_log("helper #%d may be untidy", i);
-	if (unmountBoot(&up))  	kextd_error_log("unmount trouble??");
+        if (g_verbose_level > 0 && up.changestate != nothingSerious) {
+            kextd_error_log("error updating helper partition %s, state %d: %s", up.bsdname,
+            up.changestate, bootReversionsStrings[up.changestate]);
+        }
+        // unroll any changes we may have made
+        (void)revertState(&up);	    // smart enough to do nothing
+        
+        // always unmount
+        if (nukeFallbacks(&up))
+            kextd_error_log("helper partition %s may be untidy", up.bsdname);
+        if (up.curBoot && unmountBoot(&up))
+            kextd_error_log("couldn't unmount helper partition %s", up.bsdname);
     }
     if (bootupdates != bootcount)  goto finish;
 
     errmsg = "trouble updating bootstamps";
     if (applyStamps(up.caches))	    goto finish;
 
-    rval = 0;
+   /* We're here if we successfully updated the helpers.  If we were expecting
+    * no updates to be needed, return EX_OSFILE, otherwise return ok.  */
+    if (expectUpToDate) {
+        rval = EX_OSFILE;
+    } else {
+        rval = EX_OK;
+    }
 
 finish:
+    // since updateBoots() -> exit(), convert common to sysexits(3) values
+    if (rval && rval != EX_OSFILE)
+	rval = getExitValueFor(rval);
     putVolumeForPath(volRoot, rval);		// handles not locked (& logs)
 
-    if (bdict)		    CFRelease(bdict);
+    if (volURL)		    CFRelease(volURL);
+    if (dadisk)		    CFRelease(dadisk);
+    if (up.boots)	    CFRelease(up.boots);
     if (up.curbootfd != -1) close(up.curbootfd);
     if (up.dasession) {
-	DASessionUnscheduleFromRunLoop(up.dasession, CFRunLoopGetCurrent(),
+        DASessionUnscheduleFromRunLoop(up.dasession, CFRunLoopGetCurrent(),
 		kCFRunLoopDefaultMode);
-	CFRelease(up.dasession);
+        CFRelease(up.dasession);
     }
-    if (rval && errmsg) {
-	    warnx("%s: %s", volRoot, errmsg);
+    if (up.caches)	    destroyCaches(up.caches);
+
+    if (rval && rval != EX_OSFILE && errmsg) {
+	warnx("%s: %s", volRoot, errmsg);
     }
 
     return rval;
@@ -257,13 +380,15 @@ static int revertState(struct updatingVol *up)
     struct bootCaches *caches = up->caches;
     Boolean doMisc;
 
+    if (g_verbose_level > 2) kextd_log("Rolling back any incomplete updates");
+	
     switch (up->changestate) {
 	// inactive booters are still good
 	case activatedBooters:
 	    // we've blessed the new booters; so let's bless the old ones
 	    pathcat(up->ofdst, OLDEXT);
 	    pathcat(up->efidst, OLDEXT);
-	    rval |= activateBooters(up);    // XX I hope this works
+	    rval |= activateBooters(up);    // XX this should reactivate the old
 	case activatingEFIBooter:
     	case activatingOFBooter:	    // unneeded since 'bless' is one op
 	case copiedBooters:
@@ -289,11 +414,11 @@ static int revertState(struct updatingVol *up)
 	// case copyingMisc:
 	// would clean up the .new turds
 
-	case nukedLabels:
+	case noLabels:
 	    // XX hacky (c.f. nukeFallbacks which nukes .disabled label)
 	    doMisc = up->doMisc;
 	    up->doMisc = false;
-	    rval |= activateMisc(up, 0);  // writes new label if !doMisc
+	    rval |= activateMisc(up);  // writes new label if !doMisc
 	    up->doMisc = doMisc;
 
 	case nothingSerious:
@@ -309,10 +434,9 @@ finish:
 * mountBoot digs in for the root, and mounts up the Apple_Boots
 * mountpoints are stored in up->bootparts
 *******************************************************************************/
-static int mountBoot(struct updatingVol *up, CFIndex bidx)
+static int mountBoot(struct updatingVol *up)
 {
     int rval = ELAST + 1;
-    char bsdname[DEVMAXPATHSIZE];
     CFStringRef mountargs[] = { CFSTR("perm"), CFSTR("nobrowse"), NULL };
     CFStringRef str;
     DADissenterRef dis = (void*)kCFNull;
@@ -321,17 +445,20 @@ static int mountBoot(struct updatingVol *up, CFIndex bidx)
     struct statfs bsfs;
     struct stat secsb;
 
-    // request the Apple_Boot mount
-    str = (CFStringRef)CFArrayGetValueAtIndex(up->boots, bidx);
-    if (!str)  goto finish;
-    if (!CFStringGetFileSystemRepresentation(str, bsdname, DEVMAXPATHSIZE))
-	goto finish;
-    if (!(up->curBoot = DADiskCreateFromBSDName(nil, up->dasession, bsdname)))
-	goto finish;
+    if (g_verbose_level > 2) kextd_log("Mounting helper partition");
 
-    // 'prefmounturl' could contain bsdname?
+    // request the Apple_Boot mount
+    str = (CFStringRef)CFArrayGetValueAtIndex(up->boots, up->bootIdx);
+    if (!str)  goto finish;
+    if (!CFStringGetFileSystemRepresentation(str, up->bsdname, DEVMAXPATHSIZE))
+	goto finish;
+    if (!(up->curBoot = DADiskCreateFromBSDName(nil,up->dasession,up->bsdname)))
+	goto finish;
+    
+    if (g_verbose_level > 2) kextd_log("%s mounted", up->bsdname);
+
     // DADiskMountWithArgument might call _daDone before it returns (e.g. if it
-    // knows your request is impossible ... 
+    // knows your request is impossible ...)
     // _daDone updates our 'dis[senter]'
     DADiskMountWithArguments(up->curBoot, NULL/*mnt*/,kDADiskMountOptionDefault,
    			     _daDone, &dis, mountargs);
@@ -344,9 +471,9 @@ static int mountBoot(struct updatingVol *up, CFIndex bidx)
 	// if it's already mounted, try to unmount it? (XX skank DEBUG(?) hack)
 	if (rval == kDAReturnBusy && up->curMount[0] != '\1') {
 	    up->curMount[0] = '\1';
-	    if (0 == unmountBoot(up)) {
+            if (0 == unmountBoot(up)) {
 		// try again
-		return mountBoot(up, bidx);
+                return mountBoot(up);
 	    }
 	}
 	goto finish;
@@ -366,7 +493,7 @@ static int mountBoot(struct updatingVol *up, CFIndex bidx)
     // we only support 128 MB Apple_Boot partitions
     if (fstatfs(up->curbootfd, &bsfs))	goto finish;
     if (bsfs.f_blocks * bsfs.f_bsize < (128 * 1<<20)) {
-	kextd_error_log("Apple_Boot < 128 MB; skipping");
+	kextd_error_log("Apple_Boot helper < 128 MB; skipping");
 	goto finish;
     }
 
@@ -381,8 +508,11 @@ finish:
 	unmountBoot(up);	// unmount anything we managed to mount
     }
     if (rval) {
-	kextd_error_log("couldn't mount helper: error %X (DA: %d)", rval,
-			rval & ~(err_local|err_local_diskarbitration));
+	if (rval != ELAST + 1)
+	    kextd_error_log("couldn't mount helper: error %#X (DA err# %#.2x)",
+			    rval,rval & ~(err_local|err_local_diskarbitration));
+	else
+	    kextd_error_log("couldn't mount helper partition");
     }
 
     return rval;
@@ -394,8 +524,10 @@ finish:
 *******************************************************************************/
 static int unmountBoot(struct updatingVol *up)
 {
-    int rval = ELAST + 1;
+    int rval = 0;
     DADissenterRef dis = (void*)kCFNull;
+    
+    if (g_verbose_level > 2) kextd_log("Unmounting helper partition %s", up->bsdname);
 
     // bail if nothing to actually unmount (still free up curBoot below)
     if (!up->curBoot)  	    	goto finish;
@@ -404,6 +536,7 @@ static int unmountBoot(struct updatingVol *up)
     if (up->curbootfd != -1)	close(up->curbootfd);
 
     // _daDone populates 'dis'[senter]
+    rval = ELAST + 1;
     DADiskUnmount(up->curBoot, kDADiskMountOptionDefault, _daDone, &dis);
     if (dis == (void*)kCFNull)	    // in case _daDone already called
 	CFRunLoopRun();
@@ -491,7 +624,7 @@ FindRPSDir(struct updatingVol *up, char prev[PATH_MAX], char current[PATH_MAX],
     haveS = (status == 0);
 
     if (haveR && haveP && haveS) {    // NComb(3,3) = 1
-        printf("WARNING: all of R,P,S exist: picking 'R'\n");
+        kextd_log("WARNING: all of R,P,S exist: picking 'R'\n");
 	curp = rpath;	nextp = ppath;	prevp = spath;
     }   else if (haveR && haveP) {          // NComb(3,2) = 3
         // p wins
@@ -523,11 +656,10 @@ FindRPSDir(struct updatingVol *up, char prev[PATH_MAX], char current[PATH_MAX],
     rval = 0;
 
 finish:
-    //DPRINTF("FindRPSDir returning %x (boot = %x)\n", rval, *newBoot);
-    //DPAUSE();
+    if (rval)
+	kextd_error_log("FindRPSDir(): %s", strerror(errno));
     return rval;
 }
-// #undef printf
 
 // UUID helper for ucopyRPS
 static int insertUUID(struct updatingVol *up, char *srcpath, char *dstpath)
@@ -538,10 +670,11 @@ static int insertUUID(struct updatingVol *up, char *srcpath, char *dstpath)
     void *buf;
     CFDataRef data = NULL;
     CFMutableDictionaryRef pldict = NULL;
-    CFIndex len;
+    CFStringRef str = NULL;
 
     mode_t dirmode;
     char dstparent[PATH_MAX];
+    CFIndex len;
 
     // suck in plist
     if (-1 == (fd = sopen(up->caches->cachefd, srcpath, O_RDONLY, 0)))
@@ -560,8 +693,11 @@ static int insertUUID(struct updatingVol *up, char *srcpath, char *dstpath)
 	if (!pldict)	goto finish;
     }
 
-    // insert key we got previously from DA
-    CFDictionarySetValue(pldict, CFSTR(kRootUUIDKey), up->caches->volUUIDStr);
+    // make a CFStr out of the UUID
+    str = CFStringCreateWithFileSystemRepresentation(nil, up->caches->uuid_str);
+    str = CFStringCreateWithCString(nil, up->caches->uuid_str, kCFStringEncodingASCII);
+    if (!str)	goto finish;
+    CFDictionarySetValue(pldict, CFSTR(kRootUUIDKey), str);
 
 
     // and write dictionary back
@@ -574,7 +710,7 @@ static int insertUUID(struct updatingVol *up, char *srcpath, char *dstpath)
     if (dirmode & S_IROTH)      dirmode |= S_IXOTH;
 
     // and recursively create the parent directory       
-    if (strlcpy(dstparent, dirname(dstpath), PATH_MAX) >= PATH_MAX)  goto finish;
+    if (strlcpy(dstparent, dirname(dstpath), PATH_MAX) >= PATH_MAX) goto finish;
     if ((sdeepmkdir(up->curbootfd, dstparent, dirmode)))            goto finish;
 
     close(fd);
@@ -588,6 +724,7 @@ static int insertUUID(struct updatingVol *up, char *srcpath, char *dstpath)
     rval = 0;
 
 finish:
+    if (str)	    CFRelease(str);
     if (data)	    CFRelease(data);
     if (pldict)     CFRelease(pldict);
     if (fd != -1)   close(fd);
@@ -603,17 +740,26 @@ static int ucopyRPS(struct updatingVol *up)
     struct stat sb;
     int i;
     char srcpath[PATH_MAX], dstpath[PATH_MAX];
+    char * plistNamePtr;
+    
+    if (g_verbose_level > 2) kextd_log("Beginning copy and atomic activation");
 
     // we're going to copy into the currently-inactive directory
     if (FindRPSDir(up, up->curRPS, discard, discard))  goto finish;
 
     // erase if present (we expect to have removed it)
     if (stat(up->curRPS, &sb) == 0) {
-	if (sdeepunlink(up->curbootfd, up->curRPS))   goto finish;
+	if (sdeepunlink(up->curbootfd, up->curRPS)) {
+	    kextd_error_log("%s: %s", up->curRPS, strerror(errno));
+	    goto finish;
+	}
     }
 
     // create the directory
-    if (smkdir(up->curbootfd, up->curRPS, kRPSDirMask))	    goto finish;
+    if (smkdir(up->curbootfd, up->curRPS, kRPSDirMask)) {
+	kextd_error_log("%s: %s", up->curRPS, strerror(errno));
+	goto finish;
+    }
 
     // and loop
     for (i = 0; i < up->caches->nrps; i++) {
@@ -624,16 +770,33 @@ static int ucopyRPS(struct updatingVol *up)
 
 	// is it Boot.plist?
 	if (&up->caches->rpspaths[i] == up->caches->bootconfig) {
+	    
+	    // PR-5115900 - name com.apple.boot.plist on APM since Tiger
+	    //	bless scribbles on com.apple.Boot.plist
+
+	    // This assert ensures BOOTPLIST_NAME and BOOTPLIST_APM_NAME are the same
+	    // length (defined at top of file).  If they differ, the code will not compile.
+	    COMPILE_TIME_ASSERT(sizeof(BOOTPLIST_NAME) == sizeof(BOOTPLIST_APM_NAME));
+
+	    // If we are on an APM partition, substitute the new plist name
+	    if (!up->isGPT) {
+		plistNamePtr = strstr(dstpath, BOOTPLIST_NAME);
+		if (plistNamePtr) {
+		    strncpy(plistNamePtr, BOOTPLIST_APM_NAME, strlen(BOOTPLIST_NAME));
+		}
+	    }
+
 	    if (insertUUID(up, srcpath, dstpath)) {
 		kextd_error_log("error populating config file %s", dstpath);
 		continue;
 	    }
 	} else {
+	    /* we might want a zero-length (cookie) file in the Apple_Boot
 	    // XX Leopard(?) other checks like is your Mach-O complete?
 	    if (stat(srcpath, &sb) == 0 && sb.st_size == 0) {
 		kextd_error_log("zero-size RPS file %s?", srcpath);
 		goto finish;
-	    }
+	    } */
 	    // scopyfile creates any intermediate directories
 	    if (scopyfile(up->caches->cachefd,srcpath,up->curbootfd,dstpath)) {
 		kextd_error_log("error copying %s", srcpath);
@@ -645,7 +808,6 @@ static int ucopyRPS(struct updatingVol *up)
     rval = 0;
 
 finish:
-
     return rval;
 }
 
@@ -660,6 +822,8 @@ static int ucopyMisc(struct updatingVol *up)
     char srcpath[PATH_MAX], dstpath[PATH_MAX];
     struct stat sb;
 
+    if (g_verbose_level > 2) kextd_log("Copying new non-booter files");
+    
     for (i = 0; i < up->caches->nmisc; i++) {
 	pathcpy(srcpath, up->caches->root);
 	pathcat(srcpath, up->caches->miscpaths[i].rpath);
@@ -684,7 +848,49 @@ finish:
 }
 
 /*******************************************************************************
-* since activateLabels will create a new label every time, we just nuke
+* moveLabels moves the labels aside in case they're needed again
+* activateMisc will move these back
+* no label -> hint of indeterminate state (label key in plist/other file?)
+* Leopard: put/switch in some sort of "(updating!)" label (see BL[ess] routines)
+*******************************************************************************/
+static int moveLabels(struct updatingVol *up)
+{
+    int rval = 0;
+    char path[PATH_MAX];
+    struct stat sb;
+    int fd = -1;
+    
+    if (g_verbose_level > 2) kextd_log("Moving aside old labels");
+
+    pathcpy(path, up->curMount);
+    pathcat(path, up->caches->label->rpath);
+    if (0 == (stat(path, &sb))) {
+	char newpath[PATH_MAX];
+	unsigned char tbxichrp[32] = {'\0', };
+
+	// rename
+	pathcpy(newpath, path);	
+	pathcat(newpath, NEWEXT);
+	rval = srename(up->curbootfd, path, newpath);
+	if (rval)	goto finish;
+
+	// remove magic type/creator
+	if (-1 == (fd=sopen(up->curbootfd, newpath, O_RDWR, 0)))  goto finish;
+	if(fsetxattr(fd,XATTR_FINDERINFO_NAME,&tbxichrp,sizeof(tbxichrp),0,0))
+	    goto finish;
+    } 
+
+    up->changestate = noLabels;
+
+finish:
+    if (fd != -1)   close(fd);
+
+    return rval;
+}
+
+/*******************************************************************************
+* nukeLabels gets rid of the label and .contentDetails files
+* since activateMisc can create a new label, we just nuke
 * no label -> hint of indeterminate state (label key in plist/other file?)
 * Leopard: put/switch in some sort of "(updating!)" label (see BL[ess] routines)
 *******************************************************************************/
@@ -693,6 +899,8 @@ static int nukeLabels(struct updatingVol *up)
     int rval = 0;
     char labelp[PATH_MAX];
     struct stat sb;
+    
+    if (g_verbose_level > 2) kextd_log("Destroying old labels");
 
     pathcpy(labelp, up->curMount);
     pathcat(labelp, up->caches->label->rpath);
@@ -707,7 +915,7 @@ static int nukeLabels(struct updatingVol *up)
 	rval |= sunlink(up->curbootfd, labelp);
     }
 
-    up->changestate = nukedLabels;
+    up->changestate = noLabels;
 
 finish:
     return rval;
@@ -721,6 +929,8 @@ static int ucopyBooters(struct updatingVol *up)
     int rval = ELAST + 1;
     char srcpath[PATH_MAX], oldpath[PATH_MAX];
 
+    if (g_verbose_level > 2) kextd_log("Copying new booters");
+    
     // copy BootX, boot.efi
     up->changestate = copyingOFBooter;
     if (up->caches->ofbooter.rpath[0]) {
@@ -732,9 +942,10 @@ static int ucopyBooters(struct updatingVol *up)
 	pathcat(oldpath, OLDEXT);	    	   // <boot>/S/L/CS/BootX.old
 
 	(void)sunlink(up->curbootfd, oldpath);
-	if (srename(up->curbootfd, up->ofdst, oldpath))	    goto finish;
+	if (srename(up->curbootfd, up->ofdst, oldpath) && errno !=ENOENT)
+	    goto finish;
 	if (scopyfile(up->caches->cachefd, srcpath, up->curbootfd, up->ofdst)) {
-	    kextd_error_log("failure copying booter %s", srcpath);
+	    kextd_error_log("%s: %s", srcpath, strerror(errno));
 	    goto finish;
 	}
     }
@@ -784,6 +995,8 @@ static int activateBooters(struct updatingVol *up)
     struct stat sb;
     char parent[PATH_MAX];
 
+    if (g_verbose_level > 2) kextd_log("Activating new booters");
+    
     // activate BootX, boot.efi
     up->changestate = activatingOFBooter;
     if (up->caches->ofbooter.rpath[0]) {
@@ -799,7 +1012,7 @@ static int activateBooters(struct updatingVol *up)
 	CLOSE(fd);
 
 	// get fileID of booter's enclosing folder 
-	pathcpy(parent, dirname(up->ofdst));		    goto finish;
+	pathcpy(parent, dirname(up->ofdst));
 	if (-1 == (fd=sopen(up->curbootfd, parent, O_RDONLY, 0)))  goto finish;
 	if (fstat(fd, &sb))				    goto finish;
 	CLOSE(fd);
@@ -843,12 +1056,14 @@ finish:
 }
 
 /*******************************************************************************
-* leap-frog w/rename() :)
+* leap-frog w/rename()
 *******************************************************************************/
 static int activateRPS(struct updatingVol *up)
 {
     int rval = ELAST + 1;
     char prevRPS[PATH_MAX], curRPS[PATH_MAX], nextRPS[PATH_MAX];
+    
+    if (g_verbose_level > 2) kextd_log("Completing copy and atomic activation");
 
     if (FindRPSDir(up, prevRPS, curRPS, nextRPS))   goto finish;
 
@@ -869,14 +1084,14 @@ finish:
 
 
 /*******************************************************************************
-* activateMisc renames .new files to final names
+* activateMisc renames .new files to final names and relabels the volumes
 * active labels indicate an updated system
 * - construct new labels with trailing numbers
 * - use BLGenerateOFLabel() and overwrite any copied-down label
 * X need to be consistent throughout regarding missing misc files (esp. label?)
 *******************************************************************************/
 #ifndef OPENSOURCE	// BLGenerateOFLabel uses CG
-static int writeLabels(struct updatingVol *up, char *labelp, int bidx)
+static int writeLabels(struct updatingVol *up, char *labelp)
 {
     int rval = ELAST + 1;
     CFDataRef lData = NULL;
@@ -884,9 +1099,12 @@ static int writeLabels(struct updatingVol *up, char *labelp, int bidx)
     int fd = -1;
     char bootname[NAME_MAX];
     char contentPath[PATH_MAX];
+    char *fmt = (CFArrayGetCount(up->boots) == 1) ? "%s" : "%s %d";
+    
+    if (g_verbose_level > 2) kextd_log("Writing new labels");
 
-    if (NAME_MAX <= snprintf(bootname, NAME_MAX, "%s %d",
-    			    up->caches->volname, bidx + 1))
+    if (NAME_MAX <= snprintf(bootname, NAME_MAX, fmt,
+    			    up->caches->volname, up->bootIdx + 1))
 	goto finish;
     if (BLGenerateOFLabel(NULL, bootname, &lData))	goto finish;
 
@@ -902,8 +1120,8 @@ static int writeLabels(struct updatingVol *up, char *labelp, int bidx)
     close(fd);
     if (-1 == (fd = sopen(up->curbootfd, contentPath, O_CREAT|O_WRONLY, 0644)))
 	goto finish;
-    len = strlen(up->caches->volname);
-    if (write(fd, up->caches->volname, len) != len)	goto finish;
+    len = strlen(bootname);
+    if (write(fd, bootname, len) != len)	goto finish;
 
     rval = 0;
 
@@ -915,16 +1133,19 @@ finish:
 }
 #endif	// OPENSOURCE
 
-static int activateMisc(struct updatingVol *up, int bidx)   // rename any .new
+static int activateMisc(struct updatingVol *up)     // rename the .new
 {
     int rval = ELAST + 1;
-    char labelp[PATH_MAX], path[PATH_MAX], opath[PATH_MAX];
+    char path[PATH_MAX], opath[PATH_MAX];
     int i = 0, nprocessed = 0;
     int fd = -1;
     struct stat sb;
     unsigned char tbxjchrp[32] = { 't','b','x','j','c','h','r','p','\0', };
-
+    
     if (up->doMisc) {
+        
+        if (g_verbose_level > 2) kextd_log("Activating non-booter files");
+        
 	// do them all
 	for (i = 0; i < up->caches->nmisc; i++) {
 	    if (strlcpy(path, up->curMount, PATH_MAX) >= PATH_MAX)   continue;
@@ -942,20 +1163,32 @@ static int activateMisc(struct updatingVol *up, int bidx)   // rename any .new
 
     }
 
-    // write labels
-    pathcpy(labelp, up->curMount);
-    pathcat(labelp, up->caches->label->rpath);
+    pathcpy(path, up->curMount);
+    pathcat(path, up->caches->label->rpath);
 #ifndef OPENSOURCE
-    (void)sunlink(up->curbootfd, labelp);
-    if (writeLabels(up, labelp, bidx))	    goto finish;
+    if (up->expectUpToDate) {
 #endif
+        // move label back
+        char newpath[PATH_MAX];
+
+        pathcpy(newpath, path);     // just rename
+        pathcat(newpath, NEWEXT);
+        (void)srename(up->curbootfd, newpath, path);
+#ifndef OPENSOURCE
+    } else {
+        // write labels
+        (void)sunlink(up->curbootfd, path);
+        if (writeLabels(up, path))          goto finish;
+#endif
+    }
 
     // assign type/creator to the label (non-OPENSOURCE might have copied)
-    if (0 == (stat(labelp, &sb))) {
-	if (-1 == (fd = sopen(up->curbootfd, labelp, O_RDWR, 0)))   goto finish;
+    if (0 == (stat(path, &sb))) {
+        if (-1 == (fd = sopen(up->curbootfd, path, O_RDWR, 0)))   goto finish;
 
-	if (fsetxattr(fd,XATTR_FINDERINFO_NAME,&tbxjchrp,sizeof(tbxjchrp),0,0))
-	    goto finish;
+        if (fsetxattr(fd,XATTR_FINDERINFO_NAME,&tbxjchrp,sizeof(tbxjchrp),0,0))
+            goto finish;
+        close(fd); fd = -1;
     }
 
     rval = (i != nprocessed);
@@ -1000,7 +1233,7 @@ static int nukeFallbacks(struct updatingVol *up)
     }
 
     // if needed, deepunlink prevRPS
-    // which, conveniently, will be right regardless of whether we succeeded :)
+    // which, conveniently, will be right regardless of whether we succeeded
     if (up->doRPS) {
 	char toss[PATH_MAX];
 

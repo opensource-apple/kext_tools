@@ -1,3 +1,25 @@
+/*
+ * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPriv.h>  // for _CFRunLoopSetCurrent()
 #include <IOKit/IOKitLib.h>
@@ -9,47 +31,52 @@
 #include <mach/mach_host.h>
 #include <mach/mach_error.h>
 #include <mach-o/arch.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 #include <libc.h>
 #include <servers/bootstrap.h>
 #include <signal.h>
 #include <sysexits.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <paths.h>
 
 #include <IOKit/kext/KXKextManager.h>
+#include <IOKit/kext/kextmanager_types.h>
+#include <IOKit/kext/kernel_check.h>
+#include <bootfiles.h>
 #include "globals.h"
 #include "logging.h"
 #include "queue.h"
 #include "request.h"
 #include "watchvol.h"
 #include "PTLock.h"
-#include "bootroot.h"
+#include "bootcaches.h"
+#include "utility.h"
 
 /*******************************************************************************
 * Globals set from invocation arguments (XX could use fewer globals :?).
 *******************************************************************************/
+#define kAppleSetupDonePath     "/var/db/.AppleSetupDone"
+#define kKXROMExtensionsFolder  "/System/Library/Caches/com.apple.romextensions/"
 
-static const char * KEXTD_SERVER_NAME = "com.apple.KernelExtensionServer";
-
-#define kKXROMExtensionsFolder        "/System/Library/Caches/com.apple.romextensions/"
-#define kKXCSystemExtensionsFolder    "/System/Library/Extensions"
-#define kKXDiskArbDelay               10
-#define kKXDiskArbMaxRetries          10
-
-
-char * progname = "(unknown)";  // don't free
+const char * progname = "(unknown)";  // don't free
 Boolean use_repository_caches = true;
 Boolean debug = false;
 Boolean load_in_task = false;
 Boolean jettison_kernel_linker = true;
-int g_verbose_level = 0;        // nonzero for -v option
+int g_verbose_level = kKXKextManagerLogLevelDefault;  // nonzero for -v option
+Boolean g_first_boot = false;
 Boolean g_safe_boot_mode = false;
 
-Boolean gStaleStartupMkext = false;
-Boolean gStaleKernel = false;
+static Boolean gStaleMkext = false;
+Boolean gStaleBootNotificationNeeded = false;
 
-static Boolean parent_received_sigterm = false;
-static Boolean parent_received_sigchld = false;
-static Boolean parent_received_sigalrm = false;
 
 // options for these are not yet implemented
 char * g_kernel_file = NULL;  // don't free
@@ -61,47 +88,39 @@ Boolean gOverwrite_symbols = true;
 * Globals created at run time.  (XX organize by which threads access them?)
 *******************************************************************************/
 
-mach_port_t g_io_master_port;
-
 KXKextManagerRef gKextManager = NULL;                  // released in main
 CFRunLoopRef gMainRunLoop = NULL;                      // released in main
 
-CFRunLoopSourceRef gRescanRunLoopSource = NULL;        // released in setup_serv
-CFRunLoopSourceRef gKernelRequestRunLoopSource = NULL; // released in setup_serv
-CFRunLoopSourceRef gClientRequestRunLoopSource = NULL; // released in setup_serv
-static CFMachPortRef gKextdSignalMachPort = NULL;      // released in setup_serv
-static CFRunLoopSourceRef gSignalRunLoopSource = NULL; // released in setup_serv
+// all the following are released in kextd_set_up_server()
+CFRunLoopTimerRef gStaleMkextMessageRunLoopTimer = NULL;
+CFRunLoopSourceRef gKernelRequestRunLoopSource = NULL; 
+CFRunLoopSourceRef gClientRequestRunLoopSource = NULL;
+static CFMachPortRef gKextdSignalMachPort = NULL;
+static CFRunLoopSourceRef gSignalRunLoopSource = NULL;
 
 #ifndef NO_CFUserNotification
 CFRunLoopSourceRef gNotificationQueueRunLoopSource = NULL;     // must release
 #endif /* NO_CFUserNotification */
 
-const char * default_kernel_file = "/mach";
+const char * default_kernel_file = NULL;
 
 queue_head_t g_request_queue;
 PTLockRef gKernelRequestQueueLock = NULL;
-PTLockRef gRunLoopSourceLock = NULL;    // XX either unnecessary or dangerous
+PTLockRef gKernSymfileDataLock = NULL;
 
-static mach_port_t gBootstrap_port = 0;
-static CFRunLoopTimerRef sDiskArbWaiter = NULL;	    // only from /etc/rc
+static CFRunLoopTimerRef sDiskArbWaiter = NULL;     // delay diskarb/watchvol
 
 /*******************************************************************************
 * Function prototypes.
 *******************************************************************************/
 
+static Boolean is_safe_boot(void);
+static Boolean kextd_prepare_link_kernel();
+static void kext_send_finished(void);
 static Boolean is_netboot(void);
-static Boolean kextd_is_running(mach_port_t * bootstrap_port_ref);
-static int kextd_get_mach_ports(void);
-static int kextd_fork(void);
 static Boolean kextd_set_up_server(void);
-static void kextd_release_parent_task(void);
 static void try_diskarb(CFRunLoopTimerRef timer, void *ctx);
-
-
 void kextd_register_signals(void);
-void kextd_parent_handle_signal(int signum);
-// void kextd_handle_sighup(int signum);    // now in globals.h
-// void kextd_handle_rescan(void * info);   // commmented out below
 
 static Boolean kextd_find_rom_mkexts(void);
 static void check_extensions_mkext(void);
@@ -109,13 +128,15 @@ static Boolean kextd_download_personalities(void);
 
 static void usage(int level);
 
-char * CFURLCopyCString(CFURLRef anURL);
-
-void kextd_rescan(
+void kextd_handle_signal(int signum);
+void kextd_runloop_signal(
     CFMachPortRef port,
-    void *msg,
-    CFIndex size,
-    void *info);
+        void * msg,
+        CFIndex size,
+        void * info);
+void kextd_rescan(void);
+
+void kextd_log_stale_mkext(CFRunLoopTimerRef timer, void *info);
 
 /*******************************************************************************
 *******************************************************************************/
@@ -126,9 +147,12 @@ int main (int argc, const char * argv[])
     KXKextManagerError result = kKXKextManagerErrorNone;
     int optchar;
     CFIndex count, i, rom_repository_idx = -1;
-    Boolean have_rom_mkexts = FALSE;
+    Boolean have_rom_mkexts = false;
+    struct stat stat_buf;
 
     CFMutableArrayRef repositoryDirectories = NULL;  // -f; must free
+
+//sleep(10);    // enable to debug under launchd until 4438161 is fixed
 
    /*****
     * Find out what my name is.
@@ -140,18 +164,21 @@ int main (int argc, const char * argv[])
         progname = (char *)argv[0];
     }
 
-    if (kextd_is_running(NULL)) {
-        // kextd_is_running() printed an error message
-        exit_status = EX_UNAVAILABLE;
-        goto finish;
-    }
-
    /*****
     * Allocate CF collection objects.
     */
     repositoryDirectories = CFArrayCreateMutable(kCFAllocatorDefault, 0,
         &kCFTypeArrayCallBacks);
     if (!repositoryDirectories) {
+        fprintf(stderr, "%s: memory allocation failure\n", progname);
+        exit_status = 1;
+        goto finish;
+    }
+
+    gKextloadedKextPaths = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    if (!gKextloadedKextPaths) {
         fprintf(stderr, "%s: memory allocation failure\n", progname);
         exit_status = 1;
         goto finish;
@@ -215,7 +242,7 @@ int main (int argc, const char * argv[])
                 goto finish;
             }
             optArg = CFStringCreateWithCString(kCFAllocatorDefault,
-               optarg, kCFStringEncodingMacRoman);
+               optarg, kCFStringEncodingUTF8);
             if (!optArg) {
                 fprintf(stderr, "%s: memory allocation failure\n", progname);
                 exit_status = 1;
@@ -230,7 +257,7 @@ int main (int argc, const char * argv[])
                 const char * next;
 
                 if (optind >= argc) {
-                    g_verbose_level = 1;
+                    g_verbose_level = kKXKextManagerLogLevelBasic;
                 } else {
                     next = argv[optind];
                     if ((next[0] == '1' || next[0] == '2' || next[0] == '3' ||
@@ -240,7 +267,7 @@ int main (int argc, const char * argv[])
                         g_verbose_level = atoi(next);
                         optind++;
                     } else if (next[0] == '-') {
-                        g_verbose_level = 1;
+                        g_verbose_level = kKXKextManagerLogLevelBasic;
                     } else if (optind < (argc - 1)) {
                         fprintf(stderr,"%s: invalid argument to -v option",
                             progname);
@@ -248,7 +275,7 @@ int main (int argc, const char * argv[])
                         exit_status = 1;
                         goto finish;
                     } else {
-                        g_verbose_level = 1;
+                        g_verbose_level = kKXKextManagerLogLevelBasic;
                     }
                 }
             }
@@ -275,69 +302,73 @@ int main (int argc, const char * argv[])
         goto finish;
     }
 
-    // Register/get Mach ports for the parent process
-    if (!kextd_get_mach_ports()) {
-        // kextd_get_mach_ports() logged the error message
-        exit_status = 1;
-        goto finish;
-    }
-
-
    /*****
-    * If not netbooting, check whether the startup mkext or kernel differ
-    * from the ones on the root partition. If so, touch the Extensions folder
-    * to force an update. Also invalidate the caches if safe booting (but
-    * don't necessarily reboot).
+    * If not running in debug mode, then hook up to syslog.
     */
-    if (!is_netboot()) {
-
-// Per email with Chris Peak, Joe Sokol, Soren Spies, disabling this
-// check until we can reliably determine if we are boot!=root.
-//        gStaleStartupMkext  = bootedFromDifferentMkext();
-//        gStaleKernel        = bootedFromDifferentKernel();
-
-        if (gStaleStartupMkext || gStaleKernel || g_safe_boot_mode) {
-            utimes("/System/Library/Extensions", NULL);
-            if (gStaleStartupMkext) {
-                kextd_log("startup mkext out of date; updating and rebooting");
-            } else if (gStaleKernel) {
-                kextd_log("startup kernel out of date");
-            } else if (g_safe_boot_mode) {
-                kextd_log("safe boot; invalidating extensions caches");
-            }
-        }
-    }
-
-   /*****
-    * If not running in debug mode, then fork and hook up to the syslog
-    * facility. Note well: a fork, if done, must be done before setting
-    * anything else up. Mach ports and other things do not transfer
-    * to the child task.
-    */
-    if (!debug && jettison_kernel_linker &&
-        !gStaleStartupMkext && !gStaleKernel) {
-
-        // Fork daemon process
-        if (!kextd_fork()) {
-            // kextd_fork() logged the error message
-            exit_status = 1;
-            goto finish;
-        }
-        // Hook up to syslogd
+    if (!debug) {
         kextd_openlog("kextd");  // should that arg be progname?
     }
 
-    // Register signal handlers
-    kextd_register_signals();
+   /*****
+    * Do some checks (XX roll into check_extensions_mkext()?):
+    * - note whether in-memory mkext differs from the one on the root
+    * - if safeboot, force a rebuild (if not in near future, at next reboot)
+    * 
+    * launchd / kextcache -U have already done any obvious updates
+    *
+    * We can't just disable loading outside of boot!=root scenarios.  Not
+    * only might kernel developers boot from custom mkexts, but to netboot
+    * an image of a DVD, the TFTP's mkext will need network drivers that
+    * aren't going to be in the mkext on the DVD.
+    *
+    * For now, gStaleMkext only left active for boot!=root.
+    * is_netboot() check should stay even if we change boot!=root policy.
+    */
+    if (is_bootroot_active() && !is_netboot()) {
+        gStaleMkext  = bootedFromDifferentMkext();
+        if (gStaleMkext)
+            kextd_log("WARNING: mkext on root filesystem does not match "
+                "the one used for startup");
+    }
+
+    // check kernel for safe boot, -x only for debugging now
+    if (is_safe_boot()) {
+        kextd_log("safe boot detected");
+        g_safe_boot_mode = true;
+        use_repository_caches = false;  // never use caches in safe boot
+    }
+
+    if (g_safe_boot_mode) {
+        kextd_log("safe boot; invalidating extensions caches");
+        utimes("/System/Library/Extensions", NULL);
+    }
+
+    // g_first_boot initialized to false
+    if (stat(kAppleSetupDonePath, &stat_buf) == -1 && errno == ENOENT) {
+        g_first_boot = true;
+    } 
+
+   /*****
+    * Check Extensions.mkext needs/ed a rebuild (BootRoot depending)
+    */
+    check_extensions_mkext();    
+
+    // XX Extensions vs. mkext times being off should also cancel kext loading.
+    // launchd shouldn't have let it come to that.  check_extensions_mkext()
+    // sets gStaleMkext if we're booted via bootroot and the mkext is stale
+    if (gStaleMkext) {
+        // kextd_log_stale_mkext(NULL, NULL);   // timer fires right away
+        gStaleBootNotificationNeeded = true;
+    }
 
    /*****
     * Jettison the kernel linker if required, and if the startup mkext &
-    * kernel aren't stale (if they are, we'll soon be rebooting).
+    * kernel aren't stale (system may end up in a weird state).
     */
     // FIXME: Need a way to make this synchronous!
-    if (jettison_kernel_linker && !gStaleStartupMkext && !gStaleKernel) {
+    if (jettison_kernel_linker && !gStaleMkext) {
         kern_return_t kern_result;
-        kern_result = IOCatalogueSendData(g_io_master_port,
+        kern_result = IOCatalogueSendData(kIOMasterPortDefault,
             kIOCatalogRemoveKernelLinker, 0, 0);
         if (kern_result != KERN_SUCCESS) {
             kextd_error_log(
@@ -349,8 +380,8 @@ int main (int argc, const char * argv[])
             // FIXME: should kextd exit in this case?
         }
 
-	have_rom_mkexts = kextd_find_rom_mkexts();
-    } 
+        have_rom_mkexts = kextd_find_rom_mkexts();
+    }
 
    /*****
     * Make sure we scan the standard Extensions folder.
@@ -362,31 +393,31 @@ int main (int argc, const char * argv[])
     * Make sure we scan the ROM Extensions folder.
     */
     if (have_rom_mkexts) {
-	rom_repository_idx = 1;
-	CFArrayInsertValueAtIndex(repositoryDirectories, rom_repository_idx,
-	    CFSTR(kKXROMExtensionsFolder));
+    rom_repository_idx = 1;
+    CFArrayInsertValueAtIndex(repositoryDirectories, rom_repository_idx,
+        CFSTR(kKXROMExtensionsFolder));
     }
 
    /*****
     * If we're not replacing the in-kernel linker, we're done.
     */
     if (!jettison_kernel_linker) {
+        kext_send_finished();
         goto finish;
     }
 
    /*****
     * If we are booting with stale data, don't bother setting up the
-    * KXKextManager.
-    */
-    if (gStaleStartupMkext || gStaleKernel) {
+    * KXKextManager. 
+    * XXX revisit since kmod_control loop needs manager plus we don't
+    * want to skip updating the mkext in the next clause.
+    * Or maybe we shouldn't call kmod_control at all when stale?
+    * XXX bootroot system hangs at boot w/stale even without this goto.  :P
+    * (launchctl -> kextcache -U should be fixing and rebooting in that case)
+    if (gStaleMkext) {
         goto server_start;
     }
-
-   /*****
-    * Check Extensions.mkext needs a rebuild
     */
-    check_extensions_mkext();	// defanged for now (watch_vol does rebuild)
-    // for 4453375 (block reboot), we may enhance this checkpoint
 
    /*****
     * Set up the kext manager.
@@ -444,7 +475,7 @@ int main (int argc, const char * argv[])
         result = KXKextManagerAddRepositoryDirectory(gKextManager,
             directoryURL, true /* scanForAdditions */,
             (use_repository_caches && (i != rom_repository_idx)),
-	    NULL);
+        NULL);
         if (result != kKXKextManagerErrorNone) {
             kextd_error_log("can't add repository (%s).",
                 KXKextManagerErrorStaticCStringForError(result));
@@ -458,7 +489,7 @@ int main (int argc, const char * argv[])
 
     KXKextManagerEnableClearRelationships(gKextManager);
 
-server_start:
+// server_start:    // unneeded?
 
     // Create CFRunLoop & sources
     if (!kextd_set_up_server()) {
@@ -466,6 +497,11 @@ server_start:
         exit_status = 1;
         goto finish;
     }
+
+    // Register signal handlers
+    // PR-5466716: The signal handler use a mach port that is initialized in
+    //             kextd_set_up_server(), so register signals after that call
+    kextd_register_signals();
 
     // Spawn kernel monitor thread
     if (!kextd_launch_kernel_request_thread()) {
@@ -478,7 +514,7 @@ server_start:
     * If our startup mkext and kernel are ok, then send the kext personalities
     * down to the kernel to trigger matching.
     */
-    if (!gStaleStartupMkext && !gStaleKernel) {
+    if (!gStaleMkext) {
         if (!kextd_download_personalities()) {
             // kextd_download_personalities() logged an error message
             exit_status = 1;
@@ -486,19 +522,21 @@ server_start:
         }
     }
 
-    // Allow parent of forked daemon to exit
-    if (!debug) {
-        kextd_release_parent_task();
+    if (!kextd_prepare_link_kernel()) {
+        goto finish;
     }
+
+    kext_send_finished();
 
     // Start run loop
     CFRunLoopRun();
 
 finish:
-    kextd_stop_volwatch();	// no-op if watch_volumes not called
-    if (gKextManager)                 CFRelease(gKextManager);
-    if (gMainRunLoop)                 CFRelease(gMainRunLoop);
+    kextd_stop_volwatch();    // no-op if watch_volumes not called
+    if (gKextManager)                  CFRelease(gKextManager);
+    if (gMainRunLoop)                  CFRelease(gMainRunLoop);
 
+    if (gKextloadedKextPaths)          CFRelease(gKextloadedKextPaths);
 #ifndef NO_CFUserNotification
     if (gPendedNonsecureKextPaths)     CFRelease(gPendedNonsecureKextPaths);
     if (gNotifiedNonsecureKextPaths)   CFRelease(gNotifiedNonsecureKextPaths);
@@ -509,31 +547,311 @@ finish:
 }
 
 /*******************************************************************************
+* is_safe_boot()
+*
+* Tell us whether the kernel says we are safe booted or not.
+*******************************************************************************/
+#define MIB_LENGTH   (2)
+
+Boolean is_safe_boot(void)
+{
+    Boolean result = false;
+    int     kern_safe_boot;
+    size_t  length;
+    int     mib_name[MIB_LENGTH] = { CTL_KERN, KERN_SAFEBOOT };
+
+    /* First check the kernel sysctl. */
+    length = sizeof(kern_safe_boot);
+    if (sysctl(mib_name, MIB_LENGTH, &kern_safe_boot, &length, NULL, 0) == 0) {
+
+        result = kern_safe_boot ? true : false;
+
+    } else {
+        kextd_error_log("sysctl failed for KERN_SAFEBOOT");
+    }
+
+    return result;
+}
+
+/*******************************************************************************
+* kextd_write_link_kernel_async()
+*******************************************************************************/
+void * kextd_write_link_kernel_async(void * arg)
+{
+    mach_timespec_t  waitTime = { 40, 0 };
+    kern_return_t kern_result;
+    char * symfile_path = kKernelSymfile;
+    int symfile_fd = -1;
+    Boolean unlink_symfile = false;
+    Boolean free_kernel_linkedit = false;
+
+   /* Run at a low I/O priority.
+    */
+    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
+
+    kern_result = IOKitWaitQuiet(kIOMasterPortDefault, &waitTime);
+    if (kern_result == kIOReturnTimeout) {
+        kextd_error_log("IOKitWaitQuiet() timed out waiting to write kernel symbols");
+    } else if (kern_result != kIOReturnSuccess) {
+        kextd_error_log("IOKitWaitQuiet() failed, waiting to write kernel symbols, "
+            "with result code %x", kern_result);
+    }
+
+   /* Now sleep for 10 seconds to give the BootCache time to finish reading
+    * its playlist (? relying on background I/O for the rest ?)
+    */
+    sleep(10);
+    
+   /* Write the symbol file if possible.
+    */
+    symfile_fd = open(symfile_path, O_CREAT|O_EXCL|O_WRONLY, 0644);
+    if (symfile_fd == -1) {
+        kextd_error_log("failed to open kernel link data file (%s) - %s",
+            symfile_path, strerror(errno));
+    } else {
+        ssize_t total_written = 0;
+        ssize_t written = 0;
+
+        kextd_log("writing kernel link data to %s", symfile_path);
+
+        while (total_written < _kload_optimized_kern_sym_length) {
+            written = write(symfile_fd, _kload_optimized_kern_sym_data + total_written,
+                _kload_optimized_kern_sym_length - total_written);
+            if (written == -1) {
+                break;
+            }
+            total_written += written;
+        }
+        if (total_written == _kload_optimized_kern_sym_length) {
+            free_kernel_linkedit = true;
+        } else {
+            if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
+                kextd_log("failed to write link data to %s",
+                    symfile_path);
+            }
+            unlink_symfile = true;
+        }
+    }
+
+   /* If we couldn't write the whole file, unlink it.
+    */
+    if (unlink_symfile) {
+        unlink(symfile_path);
+    }
+
+   /* Whether we wrote the symfile or not, ditch it from kextd so that we fall
+    * back to the standard mechanisms for both kextload and kextd.
+    */
+    PTLockTakeLock(gKernSymfileDataLock);
+    vm_deallocate(mach_task_self(),
+        (vm_address_t)_kload_optimized_kern_sym_data, _kload_optimized_kern_sym_length);
+    _kload_optimized_kern_sym_data = NULL;
+    _kload_optimized_kern_sym_length = 0;
+    PTLockUnlock(gKernSymfileDataLock);
+
+   /* If we wrote usable symbols, tell the kernel to free its
+    * linkedit segment. We may have already done this in
+    * kextd_prepare_link_kernel(), but we may not have!
+    */
+    if (free_kernel_linkedit) {
+        mach_port_t host_port = MACH_PORT_NULL;
+        void * data = 0;
+        mach_msg_type_number_t data_size = 0;
+
+        if (!unlink_symfile && g_verbose_level >= kKXKextManagerLogLevelBasic) {
+            kextd_log("using %s for kernel link symbols", symfile_path);
+        }
+
+        host_port = mach_host_self(); /* must be privileged to work */
+        if (!MACH_PORT_VALID(host_port)) {
+            kextd_error_log("can't get host port to communicate with kernel");
+            goto finish;
+        }
+
+       /* We don't care about the return value here.
+        */
+        kmod_control(host_port, 0, KMOD_CNTL_FREE_LINKEDIT_DATA, &data,
+            &data_size);
+
+        mach_port_deallocate(mach_task_self(), host_port);
+    }
+
+finish:
+    if (symfile_fd != -1) {
+        close(symfile_fd);
+    }
+
+    pthread_exit(NULL);
+    return NULL;
+}
+
+/*******************************************************************************
+* kextd_write_link_kernel_async()
+*
+* Returns false if a nonrecoverable error has occurred, true otherwise. We
+* may be unable to link kexts if we couldn't locate kernel link symbols, but
+* kextd will be running to service other requests.
+*******************************************************************************/
+static Boolean kextd_prepare_link_kernel()
+{
+    Boolean result = false;
+    mach_port_t host_port = MACH_PORT_NULL;
+    char * which_kernel = NULL;
+    struct statfs root_statfs_buf;
+    kern_return_t kern_result;
+    int compareResult;
+    Boolean free_kernel_linkedit = false;
+
+    host_port = mach_host_self(); /* must be privileged to work */
+    if (!MACH_PORT_VALID(host_port)) {
+        kextd_error_log("can't get host port to communicate with kernel");
+        goto finish;
+    }
+
+    gKernSymfileDataLock = PTLockCreate();
+    if (!gKernSymfileDataLock) {
+        kextd_error_log("failed to create kernel symbol data lock");
+        goto finish;
+    }
+
+   /*****
+    * First check if the root filesystem is read-only. If it is, we can't
+    * generate symbols and will end up falling back to /mach_kernel or the
+    * running kernel.
+    */
+    if (statfs("/", &root_statfs_buf) != 0) {
+        kextd_error_log("can't stat root filesystem");
+        // not a hard failure
+    } else if (root_statfs_buf.f_flags & MNT_RDONLY) {
+        kextd_error_log("root filesystem is read-only; "
+            "skipping kernel link data generation");
+    } else {
+
+       /* Direct from the kernel if available, and write to disk.
+        */
+        if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
+            kextd_log("requesting link data from running kernel");
+        }
+        PTLockTakeLock(gKernSymfileDataLock);
+        kern_result = kmod_control(host_port, 0, KMOD_CNTL_GET_KERNEL_SYMBOLS,
+            (kmod_args_t *)&_kload_optimized_kern_sym_data, &_kload_optimized_kern_sym_length);
+        PTLockUnlock(gKernSymfileDataLock);
+        if (kern_result == KERN_SUCCESS && _kload_optimized_kern_sym_length > 0) {
+            pthread_attr_t thread_attr;
+            pthread_t      thread;
+
+            pthread_attr_init(&thread_attr);
+            pthread_create(&thread,
+                &thread_attr,
+                kextd_write_link_kernel_async, NULL);
+            pthread_detach(thread);
+
+            which_kernel = "(running kernel)";
+
+        } else if (kern_result == KERN_MEMORY_FAILURE) {
+           /* KERN_MEMORY_FAILURE means the kernel has explicitly
+            * dropped its link data.
+            */
+            kextd_error_log("kernel freed its link data; "
+                "trying on-disk kernel file (%s)", kDefaultKernel);
+        } else {
+            kextd_error_log("can't get link data from running kernel");
+        }
+    }
+
+   /* If we couldn't write a symbol file, check /mach_kernel to see if we
+    * can use that.
+    */
+    if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
+        kextd_log("checking %s for UUID match and kernel link symbols",
+            kDefaultKernel);
+    }
+
+    compareResult = machoUUIDsMatch(host_port, NULL /* running kernel */,
+        kDefaultKernel);
+
+    if (1 == compareResult) {
+        if (!which_kernel) {
+            which_kernel = kDefaultKernel;
+        }
+        free_kernel_linkedit = true;
+    } else if (0 == compareResult) {
+        kextd_error_log("notice - UUID of on-disk kernel (%s) "
+            "does not match running kernel", kDefaultKernel);
+    } else {
+        kextd_error_log("error - can't compare running/on-disk kernel UUIDs");
+    }
+
+   /* If we found usable symbols on disk, tell the kernel to free its
+    * linkedit segment.
+    */
+    if (free_kernel_linkedit) {
+        void * data = 0;
+        mach_msg_type_number_t data_size = 0;
+
+       /* We don't care about the return value here.
+        */
+        kmod_control(host_port, 0, KMOD_CNTL_FREE_LINKEDIT_DATA, &data,
+            &data_size);
+    }
+    
+    result = true;
+finish:
+
+   /* Dispose of the host port to prevent security breaches and port
+    * leaks. We don't care about the kern_return_t value of this
+    * call for now as there's nothing we can do if it fails.
+    */
+    if (MACH_PORT_NULL != host_port) {
+        mach_port_deallocate(mach_task_self(), host_port);
+        host_port = MACH_PORT_NULL;
+    }
+
+    if (which_kernel && g_verbose_level >= kKXKextManagerLogLevelBasic) {
+        kextd_log("using %s for kernel link symbols", which_kernel);
+    }
+
+    return result;
+}
+
+/*******************************************************************************
 *
 *******************************************************************************/
 
-// since kextd runs as root; consider a non-world-writable directory
-#define TEMP_FILE		"/tmp/com.apple.iokit.kextd.XX"  // XX -> DOS?
-#define MKEXTUNPACK_COMMAND	"/usr/sbin/mkextunpack "	\
-				"-d "kKXROMExtensionsFolder" "
+#define TEMP_FILE        "/tmp/com.apple.iokit.kextd.XXXXXX"
+#define MKEXTUNPACK_COMMAND    "/usr/sbin/mkextunpack "    \
+                "-d "kKXROMExtensionsFolder" "
+#define TEMP_FILE_PERMS         (0644)
 
 static kern_return_t process_mkext(const UInt8 * bytes, CFIndex length)
 {
-    kern_return_t	err;
-    char		temp_file[1 + strlen(TEMP_FILE)];
-    char		mkextunpack_cmd[1 + strlen(TEMP_FILE) + strlen(MKEXTUNPACK_COMMAND)];
-    const char *	rom_ext_dir = kKXROMExtensionsFolder;
-    int 		outfd = -1;
-    struct stat		stat_buf;
+    kern_return_t    err;
+    char        temp_file[1 + strlen(TEMP_FILE)];
+    char        mkextunpack_cmd[1 + strlen(TEMP_FILE) + strlen(MKEXTUNPACK_COMMAND)];
+    const char *    rom_ext_dir = kKXROMExtensionsFolder;
+    int         outfd = -1;
+    struct stat         stat_buf;
+    mode_t              real_umask;
     
     strcpy(temp_file, TEMP_FILE);
-    mktemp(temp_file); // XXX insecure file handling (mkstemp is your friend :)
-    outfd = open(temp_file, O_WRONLY|O_CREAT|O_TRUNC, 0666); // at least O_EXCL
+
+    outfd = mkstemp(temp_file);
     if (-1 == outfd) {
-	kextd_error_log("can't create %s - %s\n", temp_file,
-	    strerror(errno));
-	err = kKXKextManagerErrorFileAccess;
-	goto finish;
+        kextd_error_log("can't create %s - %s", temp_file,
+            strerror(errno));
+        err = kKXKextManagerErrorFileAccess;
+        goto finish;
+    }
+
+   /* Set the umask to get it, then set it back to iself. Wish there were a
+    * better way to query it.
+    */
+    real_umask = umask(0);
+    umask(real_umask);
+
+    if (-1 == fchmod(outfd, TEMP_FILE_PERMS & ~real_umask)) {
+        kextd_error_log("unable to chmod temp file %s: %s", temp_file,
+            strerror(errno));
     }
 
     if (length != write(outfd, bytes, length))
@@ -543,7 +861,7 @@ static kern_return_t process_mkext(const UInt8 * bytes, CFIndex length)
 
     if (kKXKextManagerErrorNone != err) {
         kextd_error_log("couldn't write output");
-	goto finish;
+        goto finish;
     }
 
     close(outfd);
@@ -551,12 +869,11 @@ static kern_return_t process_mkext(const UInt8 * bytes, CFIndex length)
 
     if (-1 == stat(rom_ext_dir, &stat_buf))
     {
-	if (0 != mkdir(rom_ext_dir, 0755))
-	{
-	    kextd_error_log("mkdir(%s) failed: %s\n", rom_ext_dir, strerror(errno));
-	    err = kKXKextManagerErrorFileAccess;
-	    goto finish;
-	}
+        if (0 != mkdir(rom_ext_dir, 0755)) {
+            kextd_error_log("mkdir(%s) failed: %s", rom_ext_dir, strerror(errno));
+            err = kKXKextManagerErrorFileAccess;
+            goto finish;
+        }
     }
 
     strcpy(mkextunpack_cmd, MKEXTUNPACK_COMMAND);
@@ -564,17 +881,17 @@ static kern_return_t process_mkext(const UInt8 * bytes, CFIndex length)
 
     // kextd_error_log(mkextunpack_cmd);
 
-    if (0 != system(mkextunpack_cmd))
-    {
-	kextd_error_log(mkextunpack_cmd);
-	kextd_error_log("failed");
-	err = kKXKextManagerErrorChildTask;
+    if (0 != system(mkextunpack_cmd)) {
+        kextd_error_log(mkextunpack_cmd);
+        kextd_error_log("failed");
+        err = kKXKextManagerErrorChildTask;
         goto finish;
     }
 
 finish:
-    if (-1 != outfd)
-	close(outfd);
+    if (-1 != outfd) {
+        close(outfd);
+    }
     unlink(temp_file);
 
     return err;
@@ -586,35 +903,35 @@ finish:
 
 static Boolean kextd_find_rom_mkexts(void)
 {
-    kern_return_t	kr;
-    CFSetRef		set = NULL;
-    CFDataRef *		mkexts = NULL;
-    CFIndex		count, idx;
-    char *		propertiesBuffer;
-    int			loaded_bytecount;
-    enum {		_kIOCatalogGetROMMkextList = 4  };
+    kern_return_t  kr;
+    CFSetRef       set = NULL;
+    CFDataRef *    mkexts = NULL;
+    CFIndex        count, idx;
+    char *         propertiesBuffer;
+    uint32_t       loaded_bytecount;
+    enum         { _kIOCatalogGetROMMkextList = 4  };
 
     kr = IOCatalogueGetData(MACH_PORT_NULL, _kIOCatalogGetROMMkextList,
-			    &propertiesBuffer, &loaded_bytecount);
+                &propertiesBuffer, &loaded_bytecount);
     if (kIOReturnSuccess == kr)
     { 
-	set = (CFSetRef)
-		IOCFUnserialize(propertiesBuffer, kCFAllocatorDefault, 0, 0);
-	vm_deallocate(mach_task_self(), (vm_address_t) propertiesBuffer, loaded_bytecount);
+    set = (CFSetRef)
+        IOCFUnserialize(propertiesBuffer, kCFAllocatorDefault, 0, 0);
+    vm_deallocate(mach_task_self(), (vm_address_t) propertiesBuffer, loaded_bytecount);
     }
     if (!set)
-	return false;
+    return false;
 
     count  = CFSetGetCount(set);
     if (count)
     {
-	mkexts = (CFDataRef *) calloc(count, sizeof(CFDataRef));
-	CFSetGetValues(set, (const void **) mkexts);
-	for (idx = 0; idx < count; idx++)
-	{
-	    process_mkext(CFDataGetBytePtr(mkexts[idx]), CFDataGetLength(mkexts[idx]));
-	}
-	free(mkexts);
+    mkexts = (CFDataRef *) calloc(count, sizeof(CFDataRef));
+    CFSetGetValues(set, (const void **) mkexts);
+    for (idx = 0; idx < count; idx++)
+    {
+        process_mkext(CFDataGetBytePtr(mkexts[idx]), CFDataGetLength(mkexts[idx]));
+    }
+    free(mkexts);
     }
     CFRelease(set);
 
@@ -625,51 +942,70 @@ static Boolean kextd_find_rom_mkexts(void)
 *
 *******************************************************************************/
 
-#define REBUILDMKEXT_COMMAND	"/usr/sbin/kextcache -elF -a ppc -a i386"
-
 static void check_extensions_mkext(void)
 {
     struct stat extensions_stat_buf;
     struct stat mkext_stat_buf;
-    Boolean rebuild;
+    Boolean outOfDate;
 
-    rebuild = (0 != stat(kKXCSystemExtensionsFolder ".mkext", &mkext_stat_buf));
-    if (!rebuild && (0 == stat(kKXCSystemExtensionsFolder, &extensions_stat_buf)))
-	rebuild = (mkext_stat_buf.st_mtime != (extensions_stat_buf.st_mtime + 1));
+/* BootRoot takes care of this now (4243070)
+    const char * kextcache_cmd = "/usr/sbin/kextcache";
+    char * const kextcache_argv[] = {
+        "kextcache",
+        "-elF",
+        "-a", "ppc",
+        "-a", "i386",
+        NULL,
+    };
+*/
+
+    // should probably move all of this to 
+    outOfDate = (0 != stat(kDefaultMkext, &mkext_stat_buf));
+    if (!outOfDate && (0 == stat(kSystemExtensionsDir, &extensions_stat_buf)))
+    outOfDate = (mkext_stat_buf.st_mtime != (extensions_stat_buf.st_mtime + 1));
     
-    if (rebuild) do
-    {
-	const NXArchInfo * arch = NXGetLocalArchInfo();
-	Boolean isGPT;
+    if (outOfDate) {
+        do {
+            // XX arch is hardcoded above; what's this about?
+            const NXArchInfo * arch = NXGetLocalArchInfo();
+            // int fork_result;
 
-	// 4618030: allow mkext rebuilds on startup if not BootRoot
-	if (isBootRoot("/", &isGPT) && isGPT) {
-	    kextd_error_log("WARNING: mkext unexpectedly out of date");
-	    break;  // skip since BootRoot logic in watchvol.c will handle
-	}
+            // 4618030: allow mkext rebuilds on startup if not BootRoot
+            // had to fix kextcache to take the lock *after* forking
+            // (-F was giving up the lock before the work was done!)
+            if (is_bootroot_active()) {
+                kextd_error_log("WARNING: mkext unexpectedly out of date w/rt Extensions folder");
+                gStaleMkext = true;
+                break;  // skip since BootRoot logic in watchvol.c will handle
+            }
 
-	if (arch)
-	    arch = NXGetArchInfoFromCpuType(arch->cputype, CPU_SUBTYPE_MULTIPLE);
-	if (!arch)
-	{
-	    kextd_error_log("unknown architecture");
-	    break;
-	}
+            if (arch) {
+                arch = NXGetArchInfoFromCpuType(arch->cputype, CPU_SUBTYPE_MULTIPLE);
+            }
+            if (!arch) {
+                kextd_error_log("unknown architecture");
+                break;
+            }
 
-	// kextd_error_log(REBUILDMKEXT_COMMAND);
+#ifdef NO_4243070
+           /* wait:false means the return value is <0 for fork/exec failures and
+            * the pid of the forked process if >0.
+            */
+            fork_result = fork_program(kextcache_cmd, kextcache_argv,
+                g_first_boot ? KEXTCACHE_DELAY_FIRST_BOOT : KEXTCACHE_DELAY_STD /* delay */,
+                false /* wait */);
+            if (fork_result < 0) {
+                kextd_error_log("couldn't fork/exec kextcache to update mkext");
+            }
+#endif  // NO_4243070
 
-	if (0 != system(REBUILDMKEXT_COMMAND))
-	{
-	    kextd_error_log(REBUILDMKEXT_COMMAND);
-	    kextd_error_log("failed");
-	    break;
-	}
+        } while (false);
     }
-    while (false);
+    return;
 }
 
 /*******************************************************************************
-*
+* is_neboot()
 *******************************************************************************/
 static Boolean is_netboot(void)
 {
@@ -695,182 +1031,21 @@ finish:
     return result;
 }
 
-
 /*******************************************************************************
-*
+* kext_send_finished()
 *******************************************************************************/
 
-static Boolean kextd_is_running(mach_port_t * bootstrap_port_ref)
-{
-    boolean_t active = FALSE;
-    Boolean result = false;
-    kern_return_t kern_result = KERN_SUCCESS;
-    mach_port_t   the_bootstrap_port;
-
-    if (bootstrap_port_ref && (*bootstrap_port_ref != PORT_NULL)) {
-        the_bootstrap_port = *bootstrap_port_ref;
-    } else {
-        /* Get the bootstrap server port */
-        kern_result = task_get_bootstrap_port(mach_task_self(),
-            &the_bootstrap_port);
-        if (kern_result != KERN_SUCCESS) {
-            kextd_error_log("task_get_bootstrap_port(): %s\n",
-                mach_error_string(kern_result));
-            exit (EX_UNAVAILABLE);
-        }
-        if (bootstrap_port_ref) {
-            *bootstrap_port_ref = the_bootstrap_port;
-        }
-    }
-
-    /* Check "kextd" server status */
-    kern_result = bootstrap_status(the_bootstrap_port,
-        (char *)KEXTD_SERVER_NAME, &active);
-    switch (kern_result) {
-      case BOOTSTRAP_SUCCESS:
-        if (active) {
-            kextd_error_log("kextd: '%s' is already active\n",
-                KEXTD_SERVER_NAME);
-            result = true;
-            goto finish;
-        }
-        break;
-
-      case BOOTSTRAP_UNKNOWN_SERVICE:
-        result = false;
-        goto finish;
-        break;
-
-      default:
-        kextd_error_log("bootstrap_status(): %s\n",
-            mach_error_string(kern_result));
-        exit(EX_UNAVAILABLE);
-    }
-
-finish:
-    return result;
-}
-
-/*******************************************************************************
-*
-*******************************************************************************/
-static int kextd_get_mach_ports(void)
+static void kext_send_finished(void)
 {
     kern_return_t kern_result;
-
-    kern_result = IOMasterPort(nil, &g_io_master_port);
-    // FIXME: check specific kernel error result for permission or whatever
+    kern_result = IOCatalogueSendData(kIOMasterPortDefault,
+        kIOCatalogKextdFinishedLaunching, 0, 0);
     if (kern_result != KERN_SUCCESS) {
-       kextd_error_log("couldn't get catalog port");
-       return 0;
-    }
-    return 1;
-}
-
-/*******************************************************************************
-*
-*******************************************************************************/
-int kextd_fork(void)
-{
-    sigset_t signal_set;
-    sigset_t old_signal_set;
-    uid_t pid;
-
-    sigemptyset(&signal_set);
-    sigaddset(&signal_set, SIGTERM);
-    sigaddset(&signal_set, SIGCHLD);
-    sigaddset(&signal_set, SIGALRM);
-
-    if (sigprocmask(SIG_BLOCK, &signal_set, &old_signal_set)) {
-         kextd_error_log("sigprocmask() failed");
-         return 0;
+        kextd_error_log(
+            "couldn't notify kernel of kextd launch; error %d", kern_result);
     }
 
-    // prep parent to receive signals from/about child
-    signal(SIGTERM, kextd_parent_handle_signal);
-    signal(SIGCHLD, kextd_parent_handle_signal);
-    signal(SIGALRM, kextd_parent_handle_signal);
-
-    pid = fork();
-    switch (pid) {
-
-      case -1:
-        return 0;  // error
-        break;
-
-      case 0:   // child task
-
-        // child doesn't process sigterm or sigalrm
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGALRM, SIG_DFL);
-
-        if (sigprocmask(SIG_UNBLOCK, &signal_set, NULL)) {
-             kextd_error_log("sigprocmask() failed");
-             return 0;
-        }
-
-        // Reregister/get Mach ports for the child
-        if (!kextd_get_mach_ports()) {
-            // kextd_get_mach_ports() logged an error message
-            exit(1);
-        }
-
-        // FIXME: old kextd did this; is it needed?
-        _CFRunLoopSetCurrent(NULL);
-        break;
-
-      default:  // parent task
-	    kextd_openlog("kextd-parent");  // should that arg be progname?
-
-		struct itimerval timer_buf;
-		timer_buf.it_interval.tv_sec = 0;
-		timer_buf.it_interval.tv_usec = 0;
-		timer_buf.it_value.tv_sec = 40;
-		timer_buf.it_value.tv_usec = 0;
-		setitimer(ITIMER_REAL, &timer_buf, NULL);
-
-		while (1) {
-			sigsuspend(&old_signal_set);
-			if (parent_received_sigterm) {
-				kern_return_t    kern_result;
-				mach_timespec_t  waitTime = { 40, 0 };
-
-				kern_result = IOKitWaitQuiet(g_io_master_port, &waitTime);
-				if (kern_result == kIOReturnTimeout) {
-					kextd_error_log("IOKitWaitQuiet() timed out",
-					kern_result);
-				} else if (kern_result != kIOReturnSuccess) {
-					kextd_error_log("IOKitWaitQuiet() failed with result code %lx",
-					kern_result);
-					exit(1);
-				}
-				exit(0);
-			} else if (parent_received_sigchld) {
-				kextd_error_log("kextd forked child task exited abnormally");
-				exit(1);
-			} else if (parent_received_sigalrm) {
-				kextd_error_log("kextd parent task timed out waiting for signal from child");
-				exit(1);
-			}
-		}
-        break;
-    }
-
-   /****
-    * Set a new session for the kextd child process.
-    */
-    if (setsid() == -1) {
-        return 0;
-    }
-
-   /****
-    * Be sure to run relative to the root of the filesystem, just in case.
-    */
-    if (chdir("/") == -1) {
-        return 0;
-    }
-
-    return 1;
+    return;
 }
 
 static void try_diskarb(CFRunLoopTimerRef timer, void *spctx)
@@ -882,19 +1057,19 @@ static void try_diskarb(CFRunLoopTimerRef timer, void *spctx)
     result = kextd_watch_volumes(priority);
 
     if (result == 0 || ++retries >= kKXDiskArbMaxRetries) {
-	CFRunLoopTimerInvalidate(sDiskArbWaiter);   // runloop held last retain
-	sDiskArbWaiter = NULL;
+        CFRunLoopTimerInvalidate(sDiskArbWaiter);   // runloop held last retain
+        sDiskArbWaiter = NULL;
     }
 
     if (result) {
-	if (retries > 1) {
-	    if (retries < kKXDiskArbMaxRetries) {
-		kextd_log("diskarb isn't ready yet; we'll try again soon");
-	    } else {
-		kextd_error_log("giving up on diskarb; auto-rebuild disabled");
-		(void)kextd_giveup_volwatch();		// logs own errors
-	    }
-	}
+        if (retries > 1) {
+            if (retries < kKXDiskArbMaxRetries) {
+                kextd_log("diskarb isn't ready yet; we'll try again soon");
+            } else {
+                kextd_error_log("giving up on diskarb; auto-rebuild disabled");
+                (void)kextd_giveup_volwatch();        // logs own errors
+            }
+        }
     }
 
 }
@@ -912,25 +1087,22 @@ extern void kextd_mach_port_callback(
 
 static Boolean kextd_set_up_server(void)
 {
-    Boolean result = true;	// XX pessimism would make for less code
+    Boolean result = true;
     kern_return_t kern_result = KERN_SUCCESS;
     CFRunLoopSourceContext sourceContext;
     unsigned int sourcePriority = 1;
     CFMachPortRef kextdMachPort = NULL;  // must release
     mach_port_limits_t limits;  // queue limit for signal-handler port
-    CFRunLoopTimerContext spctx = { 0, };
+    mach_port_t servicePort;
+    CFRunLoopTimerContext spctx = { 0, };   // to pass along source priority
+    CFAbsoluteTime diskArbDelay;
 
-    if (kextd_is_running(&gBootstrap_port)) {
-        result = false;
-        goto finish;
-    }
+    kern_result = bootstrap_check_in(bootstrap_port,
+            KEXTD_SERVER_NAME, &servicePort);
 
-    gRunLoopSourceLock = PTLockCreate();
-    if (!gRunLoopSourceLock) {
-        kextd_error_log(
-            "failed to create kernel request run loop source lock");
-        result = false;
-        goto finish;
+    if (kern_result != BOOTSTRAP_SUCCESS) {
+        kextd_error_log("bootstrap_check_in(): %s", bootstrap_strerror(kern_result));
+        exit(EX_OSERR);
     }
 
     gMainRunLoop = CFRunLoopGetCurrent();
@@ -950,18 +1122,6 @@ static Boolean kextd_set_up_server(void)
     * priority; sharing them causes unpredictable behavior with the runloop.
     * Note: CFRunLoop.h says 'order' should generally be 0 for all.
     */
-/* I think we can do without this bit ... request.c now calls _handle_sighup
-    sourceContext.perform = kextd_handle_rescan;
-    gRescanRunLoopSource = CFRunLoopSourceCreate(kCFAllocatorDefault,
-        sourcePriority++, &sourceContext);
-    if (!gRescanRunLoopSource) {
-       kextd_error_log("couldn't create signal-handling run loop source");
-        result = false;
-        goto finish;
-    }
-    CFRunLoopAddSource(gMainRunLoop, gRescanRunLoopSource,
-        kCFRunLoopDefaultMode);
-*/
 
     sourceContext.perform = kextd_handle_kernel_request;
     gKernelRequestRunLoopSource = CFRunLoopSourceCreate(kCFAllocatorDefault,
@@ -974,8 +1134,8 @@ static Boolean kextd_set_up_server(void)
     CFRunLoopAddSource(gMainRunLoop, gKernelRequestRunLoopSource,
         kCFRunLoopDefaultMode);
 
-    kextdMachPort = CFMachPortCreate(kCFAllocatorDefault,
-        kextd_mach_port_callback, NULL, NULL);
+    kextdMachPort = CFMachPortCreateWithPort(kCFAllocatorDefault,
+        servicePort, kextd_mach_port_callback, NULL, NULL);
     gClientRequestRunLoopSource = CFMachPortCreateRunLoopSource(
         kCFAllocatorDefault, kextdMachPort, sourcePriority++);
     if (!gClientRequestRunLoopSource) {
@@ -986,18 +1146,21 @@ static Boolean kextd_set_up_server(void)
     CFRunLoopAddSource(gMainRunLoop, gClientRequestRunLoopSource,
         kCFRunLoopDefaultMode);
 
+    // don't talk to diskarb until five minutes after first boot
+    // XX should move this delay so it prevents auto-updates, not diskarb
+    diskArbDelay =g_first_boot ? KEXTCACHE_DELAY_FIRST_BOOT:KEXTCACHE_DELAY_STD;
     spctx.info = (void*)(intptr_t)sourcePriority++;
     sDiskArbWaiter = CFRunLoopTimerCreate(nil, CFAbsoluteTimeGetCurrent() + 
-	kKXDiskArbDelay,kKXDiskArbDelay,0,sourcePriority++,try_diskarb,&spctx);
+        diskArbDelay,diskArbDelay,0,sourcePriority++,try_diskarb,&spctx);
     if (!sDiskArbWaiter) {
-	result = false;
-	goto finish;
+        result = false;
+        goto finish;
     }
     CFRunLoopAddTimer(gMainRunLoop, sDiskArbWaiter, kCFRunLoopDefaultMode);
-    CFRelease(sDiskArbWaiter);	    // later invalidation will free
+    CFRelease(sDiskArbWaiter);        // later invalidation will free
 
     gKextdSignalMachPort = CFMachPortCreate(kCFAllocatorDefault,
-        kextd_rescan, NULL, NULL);
+        kextd_runloop_signal, NULL, NULL);
     limits.mpl_qlimit = 1;
     kern_result = mach_port_set_attributes(mach_task_self(),
         CFMachPortGetPort(gKextdSignalMachPort),
@@ -1010,7 +1173,7 @@ static Boolean kextd_set_up_server(void)
     gSignalRunLoopSource = CFMachPortCreateRunLoopSource(
         kCFAllocatorDefault, gKextdSignalMachPort, sourcePriority++);
     if (!gSignalRunLoopSource) {
-	kextd_error_log("couldn't create signal-handling run loop source");
+    kextd_error_log("couldn't create signal-handling run loop source");
         result = false;
         goto finish;
     }
@@ -1032,6 +1195,18 @@ static Boolean kextd_set_up_server(void)
 
 #endif /* NO_CFUserNotification */
 
+    if (gStaleMkext) {
+        gStaleMkextMessageRunLoopTimer=CFRunLoopTimerCreate(kCFAllocatorDefault,
+            0, 30.0 /* seconds */, 0, 0, &kextd_log_stale_mkext, NULL);
+        if (!gStaleMkextMessageRunLoopTimer) {
+           kextd_error_log("couldn't create kernel stale message run loop timer");
+            result = false;
+            goto finish;
+        }
+        CFRunLoopAddTimer(gMainRunLoop, gStaleMkextMessageRunLoopTimer,
+            kCFRunLoopDefaultMode);
+    }
+
    /* Watch for RAID changes so we can forcibly update their boot partitions.
     */
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
@@ -1045,31 +1220,8 @@ static Boolean kextd_set_up_server(void)
         kextd_error_log("couldn't register for RAID notifications");
     }
 
-    kextd_log("registering service \"%s\"", KEXTD_SERVER_NAME);
-    kern_result = bootstrap_register(bootstrap_port,
-        (char *)KEXTD_SERVER_NAME, CFMachPortGetPort(kextdMachPort));
-
-    switch (kern_result) {
-      case BOOTSTRAP_SUCCESS:
-        /* service not currently registered, "a good thing" (tm) */
-        break;
-
-      case BOOTSTRAP_NOT_PRIVILEGED:
-        kextd_error_log("bootstrap_register(): bootstrap not privileged");
-        exit(EX_OSERR);
-
-      case BOOTSTRAP_SERVICE_ACTIVE:
-        kextd_error_log("bootstrap_register(): bootstrap service active");
-        exit(EX_OSERR);
-
-      default:
-        kextd_error_log("bootstrap_register(): %s",
-            mach_error_string(kern_result));
-        exit(EX_OSERR);
-    }
-
 finish:
-    if (gRescanRunLoopSource)         CFRelease(gRescanRunLoopSource);
+    if (gStaleMkextMessageRunLoopTimer)  CFRelease(gStaleMkextMessageRunLoopTimer);
     if (gKernelRequestRunLoopSource)  CFRelease(gKernelRequestRunLoopSource);
     if (gClientRequestRunLoopSource)  CFRelease(gClientRequestRunLoopSource);
     if (gKextdSignalMachPort)         CFRelease(gKextdSignalMachPort);
@@ -1085,39 +1237,10 @@ finish:
 /*******************************************************************************
 *
 *******************************************************************************/
-void kextd_release_parent_task(void)
-{
-    // FIXME: Add error checking?
-    kill(getppid(), SIGTERM);
-    return;
-}
-
-/*******************************************************************************
-*
-*******************************************************************************/
 void kextd_register_signals(void)
 {
-    signal(SIGHUP, kextd_handle_sighup);
-    return;
-}
-
-/*******************************************************************************
-* registered and used by parent of forked daemon to exit
-* upon signal from forked daemon.
-*******************************************************************************/
-void kextd_parent_handle_signal(int signum)
-{
-    switch (signum) {
-      case SIGTERM:
-        parent_received_sigterm = true;
-        break;
-      case SIGCHLD:
-        parent_received_sigchld = true;
-        break;
-      case SIGALRM:
-        parent_received_sigalrm = true;
-        break;
-    }
+    signal(SIGHUP, kextd_handle_signal);
+    signal(SIGTERM, kextd_handle_signal);
     return;
 }
 
@@ -1126,29 +1249,32 @@ void kextd_parent_handle_signal(int signum)
 * causing the run loop handler function kextd_rescan() to be
 * called on the main thread.
 *******************************************************************************/
-void kextd_handle_sighup(int signum)
+typedef struct {
+    mach_msg_header_t header;
+    int signum;
+} kextd_mach_msg_signal_t;
+    
+void kextd_handle_signal(int signum)
 {
-    mach_msg_empty_send_t msg;
+    kextd_mach_msg_signal_t msg;
     mach_msg_option_t options;
     kern_return_t kern_result;
 
-    if (signum != SIGHUP) {
+    if (signum != SIGHUP && signum != SIGTERM) {
         return;
     }
 
-   /*
-    * send message to indicate that a request has been made
-    * for the daemon to be shutdown.
-    */
+    msg.signum = signum;
+
     msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    msg.header.msgh_size = sizeof(msg);
+    msg.header.msgh_size = sizeof(msg.header);
     msg.header.msgh_remote_port = CFMachPortGetPort(gKextdSignalMachPort);
     msg.header.msgh_local_port = MACH_PORT_NULL;
     msg.header.msgh_id = 0;
     options = MACH_SEND_TIMEOUT;
     kern_result = mach_msg(&msg.header,  /* msg */
-        MACH_SEND_MSG|options,      /* options */
-        msg.header.msgh_size,       /* send_size */
+        MACH_SEND_MSG | options,    /* options */
+        sizeof(msg),                /* send_size */
         0,                          /* rcv_size */
         MACH_PORT_NULL,             /* rcv_name */
         0,                          /* timeout */
@@ -1156,53 +1282,39 @@ void kextd_handle_sighup(int signum)
     return;
 }
 
-
-/*
-    // check for HUP-generated message
-    if (m->msgh_id == 0) {
-	*forceRebuild = true;
-*/
-
 void kextd_clear_all_notifications(void);
 /*******************************************************************************
-* kextd_handle_rescan/kextd_runloop_handle_sighup was redundant
 *******************************************************************************/
-void kextd_rescan(
-    CFMachPortRef port,
-    void *msg,
-    CFIndex size,
-    void *info)
+void kextd_rescan(void)
 {
-
 #ifndef NO_CFUserNotification
     kextd_clear_all_notifications();
 #endif /* NO_CFUserNotification */
 
-    KXKextManagerResetAllRepositories(gKextManager);  // resets "/"
+    KXKextManagerResetAllRepositories(gKextManager);
 
     // need to trigger check_rebuild (in watchvol.c) for mkext, etc
     // perhaps via mach message to the notification port
-    // should we let it handly the ResetAllRepos?
+    // should we let it handle the ResetAllRepos?
 
     // FIXME: Should we exit if this fails?
     kextd_download_personalities();
-
 }
 
-/* I don't think we need this extra layer of indirection
+/*******************************************************************************
+*******************************************************************************/
+void kextd_runloop_signal(CFMachPortRef port, void * msg, CFIndex size, void * info)
 {
-    if (gRescanRunLoopSource) {
-        PTLockTakeLock(gRunLoopSourceLock);
-        kextd_log("received SIGHUP; rescanning kexts and resetting catalogue");
-        CFRunLoopSourceSignal(gRescanRunLoopSource);
-        CFRunLoopWakeUp(gMainRunLoop);
-        PTLockUnlock(gRunLoopSourceLock);
-    } else {
-        kextd_log("received SIGHUP before entering run loop; ignoring");
+    kextd_mach_msg_signal_t * signal_msg = (kextd_mach_msg_signal_t *)msg;
+    int signum = signal_msg->signum;
+    
+    if (signum == SIGHUP) {
+        kextd_rescan();
+    } else if (signum == SIGTERM) {
+        CFRunLoopStop(CFRunLoopGetCurrent());
     }
     return;
 }
-*/
 
 #ifndef NO_CFUserNotification
 /*******************************************************************************
@@ -1242,7 +1354,49 @@ void kextd_clear_all_notifications(void)
 /*******************************************************************************
 *
 *******************************************************************************/
-// void kextd_handle_rescan(void * info)
+void kextd_log_stale_mkext(
+   CFRunLoopTimerRef timer, 
+   void *info
+)
+{
+    kextd_error_log("in-memory mkext doesn't match on-disk mkext; "
+                    "non-boot kexts won't be loaded");
+    return;
+}
+
+
+/******************************************************************************
+* is_bootroot_active() checks for the booter hint
+******************************************************************************/
+bool is_bootroot_active(void)
+{
+    int result = false;
+    io_service_t chosen = 0;     // must IOObjectRelease()
+    CFTypeRef bootrootProp = 0;  // must CFRelease()
+
+    chosen = IORegistryEntryFromPath(kIOMasterPortDefault,
+           "IODeviceTree:/chosen");
+    if (!chosen) {
+        goto finish;
+    }
+    
+    bootrootProp = IORegistryEntryCreateCFProperty(
+        chosen, CFSTR(kBootRootActiveKey), kCFAllocatorDefault,
+        0 /* options */);
+        
+   /* Mere presence of the property indicates that we are
+    * boot!=root, type and value are irrelevant.
+    */
+    if (bootrootProp) {
+        result = true;
+    }
+    
+finish:
+    if (chosen)       IOObjectRelease(chosen);
+    if (bootrootProp) CFRelease(bootrootProp);
+    return result;
+}
+
 
 /*******************************************************************************
 *
@@ -1256,64 +1410,11 @@ static Boolean kextd_download_personalities(void)
     return (kKXKextManagerErrorNone == result) ? true : false;
 }
 
-/*******************************************************************************
-*
-*******************************************************************************/
-#if 0
-static Boolean kextd_process_ndrvs(CFArrayRef repositoryDirectories)
-{
-    Boolean     result = true;
-    CFIndex     repositoryCount, r;
-    CFStringRef thisPath = NULL;        // don't release
-    CFURLRef    repositoryURL = NULL;   // must release
-    CFURLRef    ndrvDirURL = NULL;      // must release
-
-    repositoryCount = CFArrayGetCount(repositoryDirectories);
-    for (r = 0; r < repositoryCount; r++) {
-
-       /* Clean up at top of loop in case of a continue.
-        */
-        if (repositoryURL) {
-            CFRelease(repositoryURL);
-            repositoryURL = NULL;
-        }
-        if (ndrvDirURL) {
-            CFRelease(ndrvDirURL);
-            ndrvDirURL = NULL;
-        }
-
-        thisPath = (CFStringRef)CFArrayGetValueAtIndex(
-            repositoryDirectories, r);
-        repositoryURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-            thisPath, kCFURLPOSIXPathStyle, true);
-        if (!repositoryURL) {
-            kextd_error_log("memory allocation failure");
-            result = 0;
-            goto finish;
-        }
-        ndrvDirURL = CFURLCreateCopyAppendingPathComponent(kCFAllocatorDefault,
-            repositoryURL, CFSTR("AppleNDRV"), true);
-        if (!ndrvDirURL) {
-            kextd_error_log("memory allocation failure");
-            result = 0;
-            goto finish;
-        }
-
-        IOLoadPEFsFromURL( ndrvDirURL, MACH_PORT_NULL );  // XX needs header?
-    }
-
-finish:
-    if (repositoryURL)   CFRelease(repositoryURL);
-    if (ndrvDirURL)      CFRelease(ndrvDirURL);
-
-    return result;
-}
-#endif
-
 
 /*******************************************************************************
 *
 *******************************************************************************/
+
 static void usage(int level)
 {
     fprintf(stderr,
@@ -1332,45 +1433,4 @@ static void usage(int level)
         fprintf(stderr, "    -x   run in safe boot mode.\n");
     }
     return;
-}
-
-/*******************************************************************************
-*
-*******************************************************************************/
-char * CFURLCopyCString(CFURLRef anURL)
-{
-    char * string = NULL; // returned
-    CFIndex bufferLength;
-    CFStringRef urlString = NULL;  // must release
-    Boolean error = false;
-
-    urlString = CFURLCopyFileSystemPath(anURL, kCFURLPOSIXPathStyle);
-    if (!urlString) {
-        goto finish;
-    }
-
-    // XX CFStringGetLength() returns a count of unicode characters; see
-    // CFStringGetMaximumSizeForEncoding()/CFStringGetFileSystemRepresentation()
-    // and CFStringGetMaximumSizeOfFileSystemRepresentation()
-    bufferLength = 1 + CFStringGetLength(urlString);
-
-    string = (char *)malloc(bufferLength * sizeof(char));
-    if (!string) {
-        goto finish;
-    }
-
-    if (!CFStringGetCString(urlString, string, bufferLength,
-           kCFStringEncodingMacRoman)) {
-
-        error = true;
-        goto finish;
-    }
-
-finish:
-    if (error) {
-        free(string);
-        string = NULL;
-    }
-    if (urlString) CFRelease(urlString);
-    return string;
 }

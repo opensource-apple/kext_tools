@@ -1,4 +1,26 @@
 /*
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+/*
  * FILE: watchvol.c
  * AUTH: Soren Spies (sspies)
  * DATE: 5 March 2006
@@ -52,60 +74,63 @@
  * this scheme to work ... could we temporarily enable owners??
  * The current plan (4554031) is to notice when VQ_UPDATE's occur ...
  * enabling owners ourselves could lead to some very mysterious behavior.
- *	
+ *  
  * $removing checkin comments expander in the header$
  */
 
 // system includes
-#include <notify.h>	// yay notify_monitor_file (well, maybe someday ;)
-#include <string.h>	// strerror()
+#include <notify.h> // yay notify_monitor_file (well, maybe someday ;)
+#include <string.h> // strerror()
 #include <sysexits.h>
-#include <sys/errno.h>
+#include <errno.h>
 #include <sys/stat.h>
-#include <sys/types.h>	// waitpid() (fork/daemon/waitpid)
-#include <sys/wait.h>	// " "
-#include <stdlib.h>	// daemon(3)
-#include <unistd.h>	// e.g. execv
+#include <sys/types.h>  // waitpid() (fork/daemon/waitpid)
+#include <sys/wait.h>   // " "
+#include <stdlib.h> // daemon(3)
+#include <signal.h>
+#include <unistd.h> // e.g. execv
 
 #include <bless.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
+#include <DiskArbitration/DiskArbitrationPrivate.h>
 #include <IOKit/kext/kextmanager_types.h>
 
-// notifyd SPI :P (at least the latter two are API for Leopard)
+// notifyd SPI
 extern uint32_t notify_monitor_file(int token, const char *name, int flags);
-#ifdef MAC_OS_X_VERSION_10_5
-extern uint32_t notify_set_state(int token, uint64_t state);
-extern uint32_t notify_get_state(int token, uint64_t *state);
-#else
-extern uint32_t notify_set_state(int token, int state);
-extern uint32_t notify_get_state(int token, int *state);
-#endif
-
+extern uint32_t notify_get_event(int token, int *ev, char *buf, int *len);
 
 // project includes
-#include "watchvol.h"	// kextd_watch_volumes
-#include "bootroot.h"	// watchedVol
-#include "logging.h"
-#include "globals.h"	// gClientUID
-// #include "safecalls.h"
+#include "watchvol.h"           // kextd_watch_volumes
+#include "bootcaches.h"         // struct bootCaches
+#include "globals.h"            // gClientUID, kextd_raise_notification
+#include "kextmanager_async.h"  // lock_*_reply()
+#include "logging.h"            // kextd_ logging
+#include "utility.h"            // fork_program()
+
 
 // constants
 #define kWatchKeyBase       "com.apple.system.kextd.fswatch"
 #define kWatchSettleTime    5
+#define kFailureLimit       5   // consecutive failures
 
-// struct watchedVol's (struct bootCaches in bootroot.h)
+
+// the type: struct watchedVol's (struct bootCaches in bootroot.h)
 // created/destroyed with volumes coming/going; stored in sFsysWatchDict
 // use notify_set_state on our notifications to point to these objects
 struct watchedVol {
-    // CFStringRef bsdName;     // DA id (is the key in sFsysWatchDict)
+    // CFUUIDRef volUUID;       // DA id (is the key in sFsysWatchDict)
     CFRunLoopTimerRef delayer;  // non-NULL if something is scheduled
     CFMachPortRef lock;         // send right to locker's port
+    CFMutableArrayRef waiters;  // reply ports awaiting this volume
     int errcount;               // did most recent locker report an error? (???)
-    Boolean disableOwners;      // should we disable owners on unlock?
+    Boolean disableOwners;      // did we enable owners on lock?
+    Boolean isBootRoot;         // should we try to update helpers?
 
     CFMutableArrayRef tokens;   // notify(3) tokens
     struct bootCaches *caches;  // parsed version of bootcaches.plist
+
+    // XX we could track the current PID of any launched kextcache
 };
 
 // module-wide data
@@ -114,14 +139,17 @@ static DAApprovalSessionRef sDAApproval = NULL;         // retain volumes
 static CFMachPortRef sFsysChangedPort = NULL;           // let us know
 static CFRunLoopSourceRef sFsysChangedSource = NULL;    // on the runloop
 static CFMutableDictionaryRef sFsysWatchDict = NULL;    // disk ids -> wstruct*s
-static CFMachPortRef sRebootLock = NULL;		// if locked for reboot
+static CFMutableDictionaryRef sReplyPorts = NULL;       // cfports -> replyPorts
+static CFMachPortRef sRebootLock = NULL;                // if locked for reboot
+static CFMachPortRef sRebootWaiter = NULL;              // only need one
 
 
 // function declarations (kextd_watch_volumes, _stop in watchvol.h)
 
-// ctor/dtor for struct watchedVol
-static struct watchedVol* create_watchedVol(CFURLRef volURL);
+// ctor/dtors
+static struct watchedVol* create_watchedVol(DADiskRef disk);
 static void destroy_watchedVol(struct watchedVol *watched);
+static CFMachPortRef createWatchedPort(mach_port_t mport, void *ctx);
 
 // volume state
 static void vol_appeared(DADiskRef disk, void *ctx);
@@ -134,16 +162,16 @@ static Boolean check_vol_busy(struct watchedVol *watched);
 static void fsys_changed(CFMachPortRef p, void *msg, CFIndex size, void *info);
 static void check_now(CFRunLoopTimerRef timer, void *ctx);    // notify timer cb
 
-// actual rebuilders!
-static Boolean check_rebuild(struct watchedVol*, Boolean force); // do anything?
+// check and act
+static Boolean check_rebuild(struct watchedVol*);   // true if launched
 
 // CFMachPort invalidation callback
-static void lock_died(CFMachPortRef p, void *info);
+static void port_died(CFMachPortRef p, void *info);
 
-// XX reboot checks (also defined in MiG) and helpers
-static Boolean reconsiderVolumes(dev_path_t busyDev);
-static Boolean reconsiderVolume(dev_path_t volDev);
-static void toggleOwners(dev_path_t disk, Boolean enableOwners);
+// helpers for volume and reboot locking routines
+static Boolean reconsiderVolumes(mountpoint_t busyVol);
+static Boolean checkAllWatched(mountpoint_t busyVol);   // true => work to do
+static void toggleOwners(mountpoint_t mount, Boolean enableOwners);
 
 // additional "local" helpers are declared/defined just before use
 
@@ -165,18 +193,18 @@ static void debug_chld(int signum) __attribute__((unused))
     pid_t childpid;
 
     if (signum != SIGCHLD)
-	twrite("debug_chld not registered for signal\n");
+        twrite("debug_chld not registered for signal\n");
     else
     if ((childpid = waitpid(-1, &status, WNOHANG)) == -1)
-	twrite("DEBUG: SIGCHLD received, but no children available?\n");
+        twrite("DEBUG: SIGCHLD received, but no children available?\n");
     else 
     if (!WIFEXITED(status))
-	twrite("DEBUG: child quit on signal?\n");
+        twrite("DEBUG: child quit on signal?\n");
     else
     if (WEXITSTATUS(status))
-	twrite("DEBUG: child exited with unhappy status\n");
+        twrite("DEBUG: child exited with unhappy status\n");
     else
-	twrite("DEBUG: child exited with happy status\n");
+        twrite("DEBUG: child exited with happy status\n");
 
     errno = olderrno;
 }
@@ -188,26 +216,33 @@ int kextd_watch_volumes(int sourcePriority)
     char *errmsg;
     CFRunLoopRef rl;
 
-    errmsg = "already watching volumes?!";
-    if (sFsysWatchDict)  goto finish;
+    errmsg = "kextd_watch_volumes() already initialized";
+    if (sFsysWatchDict)     goto finish;
 
     // the callbacks will want to go digging in here, so set it up first
     errmsg = "couldn't create data structures";
+    // sFsysWatchDict keeps track of watched volumes with UUIDs as keys
     sFsysWatchDict = CFDictionaryCreateMutable(nil, 0,
-	&kCFTypeDictionaryKeyCallBacks, NULL);  // storing watchedVol*'s
-    if (!sFsysWatchDict)  goto finish;
+            &kCFTypeDictionaryKeyCallBacks, NULL);  // storing watchedVol*'s
+    if (!sFsysWatchDict)    goto finish;
+    // We keep two ports for a client; one to for death tracking and one  to
+    // reply when the time comes.  sReplyPorts maps between the CF wrapper
+    // for the death-tracking port and the mach_port_t replyPort.
+    sReplyPorts = CFDictionaryCreateMutable(nil, 0,
+            &kCFTypeDictionaryKeyCallBacks, NULL);  // storing mach_port_t's
+    if (!sReplyPorts)       goto finish;
 
-    errmsg = "trouble setting up ports and sources";
+    errmsg = "error setting up ports and sources";
     rl = CFRunLoopGetCurrent();
-    if (!rl)  goto finish;
+    if (!rl)    goto finish;
 
     // change notifications will eventually come in through this port/source
     sFsysChangedPort = CFMachPortCreate(nil, fsys_changed, NULL, NULL);
     // we have to keep these objects so we can unschedule them later?
-    if (!sFsysChangedPort)  goto finish;
+    if (!sFsysChangedPort)      goto finish;
     sFsysChangedSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault,
-	sFsysChangedPort, sourcePriority);
-    if (!sFsysChangedSource)  goto finish;
+    sFsysChangedPort, sourcePriority);
+    if (!sFsysChangedSource)    goto finish;
     CFRunLoopAddSource(rl, sFsysChangedSource, kCFRunLoopDefaultMode);
 
     // in general, being on the runloop means we could be called ...
@@ -226,19 +261,19 @@ int kextd_watch_volumes(int sourcePriority)
     sDAApproval = DAApprovalSessionCreate(nil);
     if (!sDAApproval)  goto finish;
     DARegisterDiskUnmountApprovalCallback(sDAApproval,
-	kDADiskDescriptionMatchVolumeMountable, is_dadisk_busy, NULL);
+    kDADiskDescriptionMatchVolumeMountable, is_dadisk_busy, NULL);
     DAApprovalSessionScheduleWithRunLoop(sDAApproval, rl,kCFRunLoopDefaultMode);
 
     // set up the regular session
     sDASession = DASessionCreate(nil);
     if (!sDASession)  goto finish;
     DARegisterDiskAppearedCallback(sDASession,
-	kDADiskDescriptionMatchVolumeMountable, vol_appeared, NULL);
+    kDADiskDescriptionMatchVolumeMountable, vol_appeared, NULL);
     DARegisterDiskDescriptionChangedCallback(sDASession,
-	kDADiskDescriptionMatchVolumeMountable,
-	kDADiskDescriptionWatchVolumePath, vol_changed, NULL);
+    kDADiskDescriptionMatchVolumeMountable,
+    kDADiskDescriptionWatchVolumePath, vol_changed, NULL);
     DARegisterDiskDisappearedCallback(sDASession,
-	kDADiskDescriptionMatchVolumeMountable, vol_disappeared, NULL);
+    kDADiskDescriptionMatchVolumeMountable, vol_disappeared, NULL);
 
     // okay, we're ready to rumble!
     DASessionScheduleWithRunLoop(sDASession, rl, kCFRunLoopDefaultMode);
@@ -254,26 +289,26 @@ int kextd_watch_volumes(int sourcePriority)
 
 finish:
     if (rval) {
-	kextd_error_log("kextd_watch_volumes: %s", errmsg);
-	kextd_stop_volwatch();
+        kextd_error_log("kextd_watch_volumes: %s", errmsg);
+        kextd_stop_volwatch();
     }
 
     return rval;
 }
 /******************************************************************************
- * kextd_giveup_volwatch (4692369) simply initializes sFsysWatchDict to 
- * be empty so that reboot locking can occur.
+ * kextd_giveup_volwatch (4692369) initializes sFsysWatchDict to empty
+ * so that locking can occur.
  *****************************************************************************/
 int kextd_giveup_volwatch()
 {
     int rval = ENOMEM;
     sFsysWatchDict = CFDictionaryCreateMutable(nil, 0,
-	&kCFTypeDictionaryKeyCallBacks, NULL);  // storing watchedVol*'s
+            &kCFTypeDictionaryKeyCallBacks, NULL);  // storing watchedVol*'s
 
     if (sFsysWatchDict) {
-	rval = 0;
+        rval = 0;
     } else {
-    	kextd_error_log("giveup_volwatch(): allocation failure");
+        kextd_error_log("giveup_volwatch(): allocation failure");
     }
 
     return rval;
@@ -297,31 +332,31 @@ void kextd_stop_volwatch()
     // runloop cleanup
     rl = CFRunLoopGetCurrent();
     if (rl && sDASession)   DASessionUnscheduleFromRunLoop(sDASession, rl,
-				kCFRunLoopDefaultMode);
+            kCFRunLoopDefaultMode);
     if (rl && sDAApproval)  DAApprovalSessionUnscheduleFromRunLoop(sDAApproval,
-				rl, kCFRunLoopDefaultMode);
+            rl, kCFRunLoopDefaultMode);
 
     // use CFRELEASE to nullify cfrefs in case watch_volumes called again
     if (sDASession) {
-	DAUnregisterCallback(sDASession, vol_disappeared, NULL);
-	DAUnregisterCallback(sDASession, vol_changed, NULL);
-	DAUnregisterCallback(sDASession, vol_appeared, NULL);
-	CFRELEASE(sDASession);
+        DAUnregisterCallback(sDASession, vol_disappeared, NULL);
+        DAUnregisterCallback(sDASession, vol_changed, NULL);
+        DAUnregisterCallback(sDASession, vol_appeared, NULL);
+        CFRELEASE(sDASession);
     }
 
     if (sDAApproval) {
-	DAUnregisterApprovalCallback(sDAApproval, is_dadisk_busy, NULL);
-	CFRELEASE(sDAApproval);
+        DAUnregisterApprovalCallback(sDAApproval, is_dadisk_busy, NULL);
+        CFRELEASE(sDAApproval);
     }
 
     if (rl && sFsysChangedSource)  CFRunLoopRemoveSource(rl, sFsysChangedSource,
-				       kCFRunLoopDefaultMode);
+            kCFRunLoopDefaultMode);
     CFRELEASE(sFsysChangedSource);
     CFRELEASE(sFsysChangedPort);
 
     if (sFsysWatchDict) {
-	CFDictionaryApplyFunction(sFsysWatchDict, free_dict_item, NULL);
-	CFRELEASE(sFsysWatchDict);
+        CFDictionaryApplyFunction(sFsysWatchDict, free_dict_item, NULL);
+        CFRELEASE(sFsysWatchDict);
     }
 
     return;
@@ -335,93 +370,158 @@ static void destroy_watchedVol(struct watchedVol *watched)
 {
     CFIndex ntokens;
     int token;      
+    int errnum;
 
-    // assert that ->delayer and ->lock have already been cleaned up
+    // assert that ->delayer, and ->lock have already been cleaned up
     if (watched->tokens) {
         ntokens = CFArrayGetCount(watched->tokens);
         while(ntokens--) { 
             token = (int)CFArrayGetValueAtIndex(watched->tokens,ntokens);
             // XX should take (hacky) steps to insure token is never zero?
-            if (/* !token || */ notify_cancel(token))
+            if (/* !token || */ (errnum = notify_cancel(token)))
                 kextd_error_log("destroy_watchedVol: "
-                        "trouble canceling notification?");
+                        "error %d canceling notification", errnum);
         }
         CFRelease(watched->tokens);
     }    
     if (watched->caches)    destroyCaches(watched->caches);
+    free(watched);
 }
 
 /******************************************************************************
 * create_watchedVol calls readCaches and creates watch-specific necessities
 ******************************************************************************/
-static struct watchedVol* create_watchedVol(CFURLRef volURL)
+static struct watchedVol* create_watchedVol(DADiskRef disk)
 {
     struct watchedVol *watched, *rval = NULL;
-    char *errmsg = NULL;
-    char rootpath[PATH_MAX] = { '\0' };
-    Boolean isGPT = false;
-    char *bsdname;
-    Boolean ownersIgnored = false;
-    struct statfs sfs;
+    char *errmsg;
+    Boolean isGPT;
 
     errmsg = "allocation error";
     watched = calloc(1, sizeof(*watched));
-    if (!watched)  goto finish;
-    if (!CFURLGetFileSystemRepresentation(volURL, false, /*CF folk: make up
-	your minds!*/ (UInt8*)rootpath, PATH_MAX)) 	goto finish;
+    if (!watched)   goto finish;
 
-    // 4616366 only watch BootRoot volumes
-    if (!isBootRoot(rootpath, &isGPT) || !isGPT) {
-	errmsg = NULL;
-	goto finish;
+    errmsg = NULL;  // no bootcaches.plist, no problem
+
+    watched->caches = readCaches(disk);     // readCaches logs errors
+    if (!watched->caches)   goto finish;
+
+    // 4616366: only watch BootRoot volumes (until 4243070)
+    if (hasBoots(watched->caches->bsdname, NULL, &isGPT)) {
+        Boolean APMBootRoot;    // Inca only supported GPT BootRoot
+
+        // 5158091: don't update boots for Inca systems on APM
+        APMBootRoot = watched->caches->ofbooter.rpath[0];   // look for BootX
+        watched->isBootRoot = isGPT || APMBootRoot;
     }
 
     // There will be RPS paths, booters, "misc" paths, and the exts folder.
     // For now, we'll just set the array size to 0 and let it grow.
+    errmsg = "allocation error";
     watched->tokens = CFArrayCreateMutable(nil, 0, NULL);
-    if (!watched->tokens)  goto finish;
+    if (!watched->tokens)   goto finish;
 
-    // try to enable owners if currently ignored
-    if (statfs(rootpath, &sfs))	    goto finish;
-    if ((bsdname = strstr(sfs.f_mntfromname, "disk"))) {
-	ownersIgnored = ((sfs.f_flags & MNT_IGNORE_OWNERSHIP) != 0);
-	if (ownersIgnored) 	toggleOwners(bsdname, true);
-    }
-
-    errmsg = NULL;	// readCaches logs its own errors
-    watched->caches = readCaches(rootpath);
-    if (!watched->caches)  goto finish;
-    
-    rval = watched;	// success?
+    errmsg = NULL;
+    rval = watched;     // success!
 
 finish:
-    if (ownersIgnored) 	    toggleOwners(bsdname, false);	// toggle back
     if (errmsg) {
-	if (rootpath[0]) {
-	    kextd_error_log("%s: %s", rootpath, errmsg);
-	} else {
-	    kextd_error_log("create_watchedVol(): %s", errmsg);
-	}
+        if (watched && watched->caches && watched->caches->root[0]) {
+            kextd_error_log("%s: %s", watched->caches->root, errmsg);
+        } else {
+            kextd_error_log("create_watchedVol(): %s", errmsg);
+        }
     }
     if (!rval && watched) {
-	destroy_watchedVol(watched);
+        destroy_watchedVol(watched);
     }
     
     return rval;
 }
 
 
-// helper
-#define cleanupLock(/*CFMachPortRef*/ lock) \
-{ \
-    mach_port_t lport; \
- \
-    if (lock) { \
-	lport = CFMachPortGetPort(lock); \
-	CFRelease(lock); \
-	lock = NULL; \
-	mach_port_deallocate(mach_task_self(), lport); \
-    } \
+// helper: caller must remove port from other structures (e.g. waiters queue)
+static int cleanupPort(CFMachPortRef *port)
+{
+    mach_port_t lport;
+
+    if (sReplyPorts)
+        CFDictionaryRemoveValue(sReplyPorts, *port); // stop tracking replyPort
+    CFMachPortSetInvalidationCallBack(*port, NULL);  // else port_died called
+    lport = CFMachPortGetPort(*port);
+    CFRelease(*port);
+    *port = NULL;
+
+    return mach_port_deallocate(mach_task_self(), lport);
+}
+
+// caller responsibile for setting up the lock and cleaning up the waiter
+static int signalWaiter(CFMachPortRef waiter, int status)
+{
+    int rval = KERN_FAILURE;
+    mach_port_t replyPort;
+
+    // extract this client's reply port and reply
+    replyPort = (mach_port_t)CFDictionaryGetValue(sReplyPorts, waiter);
+    CFDictionaryRemoveValue(sReplyPorts, waiter);
+
+    if (replyPort != MACH_PORT_NULL)
+        if (waiter == sRebootWaiter) {
+            mountpoint_t empty;
+            rval = lock_reboot_reply(replyPort, KERN_SUCCESS, empty, status);
+        } else {
+            rval = lock_volume_reply(replyPort, KERN_SUCCESS, status);
+        }
+
+    if (rval)
+        kextd_error_log("signalWaiter failed: %s", mach_error_string(rval));
+    return rval;
+} 
+
+// sRebootWaiter must be set; sRebootLock is released if held
+static void handleRebootHandoff()
+{
+    mountpoint_t busyVol;
+
+    // make sure we're allowed to give out the reboot lock
+    if (checkAllWatched(busyVol) == EBUSY) {
+        kextd_log("%s is still busy, delaying reboot", busyVol);
+        goto finish;
+    }
+
+    // signal the waiter 
+    if (signalWaiter(sRebootWaiter, KERN_SUCCESS) == 0) {
+        // on success, make the waiter the locker
+        sRebootLock = sRebootWaiter;
+    }
+    sRebootWaiter = NULL;
+
+finish:
+    return;
+}
+
+// cleans up watched->lock, checks for waiters, assigns the lock, and signals
+static void handleWatchedHandoff(struct watchedVol *watched)
+{
+    CFMachPortRef waiter = NULL;
+
+    // release existing lock
+    if (watched->lock)
+        cleanupPort(&watched->lock);
+ 
+    // see if we have any waiters
+    if (watched->waiters && CFArrayGetCount(watched->waiters)) {
+        waiter = (CFMachPortRef)CFArrayGetValueAtIndex(watched->waiters, 0);
+
+        // move waiter into the pole position and remove from the array
+        watched->lock = waiter;     // context already set to 'watched'
+        CFArrayRemoveValueAtIndex(watched->waiters, 0);
+
+        // signal the waiter, cleaning up on failure
+        if (signalWaiter(waiter, KERN_SUCCESS)) {
+            cleanupPort(&watched->lock);    // deallocates former waiter
+        }
+    }
 }
 
 /******************************************************************************
@@ -437,17 +537,14 @@ static int watch_path(char *path, mach_port_t port, struct watchedVol* watched)
     int rval = ELAST + 1;   // cheesy
     char key[PATH_MAX];
     int token = 0;
-#ifdef MAC_OS_X_VERSION_10_5
+    int errnum;
     uint64_t state;
-#else
-    int state;
-#endif
 
     // generate key, register for token, monitor, record pointer in token
     if (strlcpy(key, kWatchKeyBase, PATH_MAX) >= PATH_MAX)  goto finish;
     if (strlcat(key, path, PATH_MAX) >= PATH_MAX)  goto finish;
     if (notify_register_mach_port(key, &port, NOTIFY_REUSE, &token))
-	goto finish;
+        goto finish;
     state = (intptr_t)watched;
     if (notify_set_state(token, state))  goto finish;
     if (notify_monitor_file(token, path, 1)) goto finish;
@@ -457,105 +554,113 @@ static int watch_path(char *path, mach_port_t port, struct watchedVol* watched)
     rval = 0;
 
 finish:
-    if (rval && token != -1 && notify_cancel(token))
-	kextd_error_log("watch_path: trouble canceling token?");
+    if (rval && token != -1 && (errnum = notify_cancel(token)))
+    kextd_error_log("watch_path: error %d canceling token", errnum);
 
     return rval;
 }
 
 #define makerootpath(caches, dst, path) do { \
-	if (strlcpy(dst, caches->root, PATH_MAX) >= PATH_MAX)	goto finish; \
-	if (strlcat(dst, path, PATH_MAX) >= PATH_MAX)		goto finish; \
+        if (strlcpy(dst, caches->root, PATH_MAX) >= PATH_MAX)   goto finish; \
+        if (strlcat(dst, path, PATH_MAX) >= PATH_MAX)           goto finish; \
     } while(0)
-static void vol_appeared(DADiskRef disk, void *ctx)
+static void vol_appeared(DADiskRef disk, void *launchCtx)
 {
-    int result = 0;	// for now, ignore inability to get basic data (4528851)
+    int result = 0; // for now, ignore inability to get basic data (4528851)
     mach_port_t fsPort;
     CFDictionaryRef ddesc = NULL;
     CFBooleanRef traitVal;
-    CFURLRef volURL;
-    CFStringRef bsdName;
+    CFUUIDRef volUUID;
     struct watchedVol *watched = NULL;
+    Boolean launched = false;
 
     struct bootCaches *caches;
     int i;
     char path[PATH_MAX];
 
-    // see if the disk is writable, etc
+    // get description so we can see if the disk is writable, etc
     ddesc = DADiskCopyDescription(disk);
-    if (!ddesc)  goto finish;
+    if (!ddesc)     goto finish;
 
-    // note: "whole" media (e.g. "disk1") have *either* mountpoints or children
-    volURL = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumePathKey);
-    if (!volURL || CFGetTypeID(volURL) != CFURLGetTypeID())  goto finish;
-
-    // bsdName is the key in the dictionary (might we already be watching?)
-    bsdName = CFDictionaryGetValue(ddesc, kDADiskDescriptionMediaBSDNameKey);
-    if (!bsdName || CFGetTypeID(bsdName) != CFStringGetTypeID())  goto finish;
-    if (CFDictionaryGetValue(sFsysWatchDict, bsdName)) {
-	kextd_error_log("refreshing watch of volume already in watch table?");
-	vol_disappeared(disk, ctx);	// brush before uncharted territory
+    // volUUID is the key in the dictionary (might we already be watching?)
+    volUUID = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID || CFGetTypeID(volUUID) != CFUUIDGetTypeID())      goto finish;
+    if ((watched = (void *)CFDictionaryGetValue(sFsysWatchDict, volUUID))) {
+        kextd_log("WARNING: removing pre-existing '%s' from watch table",
+                  watched->caches->root);
+        // here's where we'd put required check-in from kextcache -U
+        // (a stub entry impliying lock interest?)
+        // (waiters removed from watched before vol_disappeared; re-added below)
+        vol_disappeared(disk, NULL);
     }
 
-    // check traits (haven't seen writable network volumes; need to custom dict)
+    // check traits (need custom dict)
+    if (!CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumePathKey))
+        goto finish;    // ignore unmounted volumes
+
     traitVal = CFDictionaryGetValue(ddesc, kDADiskDescriptionMediaWritableKey);
     if (!traitVal || CFGetTypeID(traitVal) != CFBooleanGetTypeID()) goto finish;
-    if (CFEqual(traitVal, kCFBooleanFalse))  goto finish;
+    if (CFEqual(traitVal, kCFBooleanFalse))     goto finish;
 
     traitVal = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeNetworkKey);
     if (!traitVal || CFGetTypeID(traitVal) != CFBooleanGetTypeID()) goto finish;
-    if (CFEqual(traitVal, kCFBooleanTrue))  goto finish;
+    if (CFEqual(traitVal, kCFBooleanTrue))      goto finish;
 
-    // kextd_log("DEBUG: proceeding with volume:"); //CFShow(bsdName);
+
     // does it have a usable bootcaches.plist? (if not, just ignored)
-    if (!(watched = create_watchedVol(volURL)))  goto finish;
-
+    if (!(watched = create_watchedVol(disk)))   goto finish;
 
     result = -1;    // anything after this is an error
     caches = watched->caches;
     // set up notifications on the change port
     fsPort = CFMachPortGetPort(sFsysChangedPort);
-    if (fsPort == MACH_PORT_NULL)  goto finish;
+    if (fsPort == MACH_PORT_NULL)               goto finish;
 
     // for path in { exts, rpspaths[], booters, miscpaths[] }
     // rpspaths contains mkext, bootconfig; miscpaths the label file
     // cache paths are relative; need to make absolute
     makerootpath(caches, path, caches->exts);
-    if (watch_path(path, fsPort, watched))  goto finish;
+    if (watch_path(path, fsPort, watched))      goto finish;
     for (i = 0; i < caches->nrps; i++) {
-	makerootpath(caches, path, caches->rpspaths[i].rpath);
-	if (watch_path(path, fsPort, watched))  	goto finish;
+        makerootpath(caches, path, caches->rpspaths[i].rpath);
+        if (watch_path(path, fsPort, watched))      goto finish;
     }
     if (caches->efibooter.rpath[0]) {
-	makerootpath(caches, path, caches->efibooter.rpath);
-	if (watch_path(path, fsPort, watched))  	goto finish;
+        makerootpath(caches, path, caches->efibooter.rpath);
+        if (watch_path(path, fsPort, watched))      goto finish;
     }
     if (caches->ofbooter.rpath[0]) {
-	makerootpath(caches, path, caches->ofbooter.rpath);
-	if (watch_path(path, fsPort, watched))  	goto finish;
+        makerootpath(caches, path, caches->ofbooter.rpath);
+        if (watch_path(path, fsPort, watched))      goto finish;
     }
     for (i = 0; i < caches->nmisc; i++) {
-	makerootpath(caches, path, caches->miscpaths[i].rpath);
-	if (watch_path(path, fsPort, watched))  	goto finish;
+        makerootpath(caches, path, caches->miscpaths[i].rpath);
+        if (watch_path(path, fsPort, watched))      goto finish;
     }
 
-    // we cleaned up any pre-existing entry for bsdName above
-    CFDictionarySetValue(sFsysWatchDict, bsdName, watched);
+    // we handled any pre-existing entry for volUUID above
+    CFDictionarySetValue(sFsysWatchDict, volUUID, watched);
 
-    (void)check_rebuild(watched, false);   // in case it needs an update
+    // make sure the new volume gets updated if needed
+    launched = check_rebuild(watched);
 
-    result = 0;           // we made it :)
+    // reconsiderVolume() gets return value through launchCtx
+    if (launchCtx) {
+        Boolean *didLaunch = launchCtx;
+        *didLaunch = launched;
+    }
+
+    result = 0;           // we made it
 
 finish:
     if (ddesc)   CFRelease(ddesc);
 
     if (result) {
-	if (watched) {
-	    kextd_error_log("trouble setting up notifications on %s",
-		watched->caches->root);
-	    destroy_watchedVol(watched);
-	}
-	// else kextd_log("DEBUG: skipping uninteresting volume");
+        if (watched) {
+            kextd_error_log("error setting up notifications on '%s'",
+                            watched->caches->root);
+            destroy_watchedVol(watched);
+        }
     }
 
     return;
@@ -573,29 +678,28 @@ static void vol_changed(DADiskRef disk, CFArrayRef keys, void* ctx)
     CFIndex i = CFArrayGetCount(keys);
     CFTypeRef key;
     CFDictionaryRef ddesc = DADiskCopyDescription(disk);
-    CFStringRef bsdName = NULL;
+    CFUUIDRef volUUID;
 
-    if (!ddesc)  goto finish;	// can't do much otherwise
+    if (!ddesc)  goto finish;   // can't do much otherwise
 
-    bsdName = CFDictionaryGetValue(ddesc,kDADiskDescriptionMediaBSDNameKey);
-    if (!bsdName)  goto finish;
+    volUUID = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID)  goto finish;
 
     while (i--)
-	if ((key = CFArrayGetValueAtIndex(keys, i)) &&
-		CFEqual(key, kDADiskDescriptionVolumePathKey)) {
-	    // kextd_log("DEBUG: mountpoint changed");
+    if ((key = CFArrayGetValueAtIndex(keys, i)) &&
+        CFEqual(key, kDADiskDescriptionVolumePathKey)) {
 
-	    // XX need to use a custom match dictionary
-	    // diskarb sends lots of notifications about random stuff
-	    // thus: only need to call _disappeared if we're watching it
-	    if (CFDictionaryGetValue(sFsysWatchDict, bsdName))
-		vol_disappeared(disk, ctx);
-	    // and: only need to call _appeared if there's a mountpoint
-	    if (CFDictionaryGetValue(ddesc, key))
-		vol_appeared(disk, ctx);
-	} else {
-	    kextd_log("vol_changed: ignoring update: no mountpoint change");
-	}
+        // XX need to use a custom match dictionary
+        // diskarb sends lots of notifications about random stuff
+        // thus: only need to call _disappeared if we're watching it
+        if (CFDictionaryGetValue(sFsysWatchDict, volUUID))
+            vol_disappeared(disk, ctx);
+        // and: only need to call _appeared if there's a mountpoint
+        if (CFDictionaryGetValue(ddesc, key))
+            vol_appeared(disk, ctx);
+    } else {
+        kextd_log("vol_changed: ignoring update: no mountpoint change");
+    }
 
 finish:
     if (ddesc)  CFRelease(ddesc);
@@ -607,38 +711,46 @@ finish:
  *****************************************************************************/
 static void vol_disappeared(DADiskRef disk, void* ctx)
 {
-    int result = 0;	// ignore weird requests (4528851)
+    // we used to report errors, but we got weird requests (4528851)
     CFDictionaryRef ddesc = NULL;
-    CFStringRef bsdName;
+    CFUUIDRef volUUID;
     struct watchedVol *watched;
 
     ddesc = DADiskCopyDescription(disk);
-    if (!ddesc)  goto finish;
-    bsdName = CFDictionaryGetValue(ddesc, kDADiskDescriptionMediaBSDNameKey);
-    if (!bsdName || CFGetTypeID(bsdName) != CFStringGetTypeID())  goto finish;
+    if (!ddesc)     goto finish;
+    volUUID = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID)   goto finish;
 
-    //kextd_log("DEBUG: vol_disappeared:");
-    //CFShow(bsdName);
-    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName);
-    if (!watched)  goto finish;
+    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, volUUID);
+    if (!watched)   goto finish;
 
-    CFDictionaryRemoveValue(sFsysWatchDict, bsdName);
+    // take it off the watch list
+    CFDictionaryRemoveValue(sFsysWatchDict, volUUID);
 
     // and in case some action was in progress
     if (watched->delayer) {
-	CFRunLoopTimerInvalidate(watched->delayer); // refcount->0
-	watched->delayer = NULL;
+        CFRunLoopTimerInvalidate(watched->delayer); // refcount->0
+        watched->delayer = NULL;
     }
-    // disappeared means perm/noperm doesn't matter
-    cleanupLock(watched->lock);
+    // see if any lockers are waiting 
+    // (off the list of watched vols so no new requests can come in)
+    if (watched->waiters) {
+        CFIndex i = CFArrayGetCount(watched->waiters);
+        CFMachPortRef waiter;
+
+        while(i--) {
+            waiter = (CFMachPortRef)CFArrayGetValueAtIndex(watched->waiters,i);
+            signalWaiter(waiter, ENOENT);
+            cleanupPort(&waiter);
+        }
+        CFRelease(watched->waiters);    // should remove all elements
+    }
+
+    // no need to toggle owners since the volume is gone
 
     destroy_watchedVol(watched);    // cancels notifications
 
-    result = 0;
-
 finish:
-    if (result)
-	kextd_error_log("vol_disappeared: unexpected error");
     if (ddesc)  CFRelease(ddesc);
 
     return;
@@ -647,29 +759,33 @@ finish:
 /******************************************************************************
  * is_dadisk_busy lets diskarb know if we'd rather nothing changed
  * note: dissenter callback is called when root initiates an unmount,
- * but the result is ignored.  :)
+ * but the result is ignored.
  *****************************************************************************/
 static DADissenterRef is_dadisk_busy(DADiskRef disk, void *ctx)
 {
-    int result = 0;	// ignore weird requests for now (4528851)
+    int result = 0;     // ignore weird requests for now (4528851)
     DADissenterRef rval = NULL;
     CFDictionaryRef ddesc = NULL;
-    CFStringRef bsdName = NULL;
+    CFUUIDRef volUUID;
     struct watchedVol *watched;
 
-    // kextd_log("DEBUG: is_dadisk_busy called");
     ddesc = DADiskCopyDescription(disk);
-    if (!ddesc)  goto finish;
-    bsdName = CFDictionaryGetValue(ddesc, kDADiskDescriptionMediaBSDNameKey);
-    if (!bsdName || CFGetTypeID(bsdName) != CFStringGetTypeID())  goto finish;
+    if (!ddesc)     goto finish;
+    volUUID = CFDictionaryGetValue(ddesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID)   goto finish;
 
     result = -1;
-    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName);
-    if (watched && check_vol_busy(watched)) {
-	rval = DADissenterCreate(nil, kDAReturnBusy, CFSTR("kextmanager busy"));
-	if (!rval)  goto finish;
+    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, volUUID);
+    if (!watched) {
+        // it might have become worth watching while we weren't :?
+        vol_appeared(disk, NULL);
+        watched = (void*)CFDictionaryGetValue(sFsysWatchDict, volUUID);
     }
-	
+    if (watched && check_vol_busy(watched)) {
+        rval = DADissenterCreate(nil, kDAReturnBusy, CFSTR("kextmanager busy"));
+        if (!rval)      goto finish;
+    }
+    
     result = 0;
 
 finish:
@@ -689,8 +805,9 @@ static Boolean check_vol_busy(struct watchedVol *watched)
 {
     Boolean rval = (watched->lock != NULL);
 
-    if (!rval)
-	rval = check_rebuild(watched, false);
+    if (!rval && watched->errcount < kFailureLimit) {
+        rval = check_rebuild(watched);
+    }
 
     return rval;
 }
@@ -703,11 +820,7 @@ static Boolean check_vol_busy(struct watchedVol *watched)
 static void fsys_changed(CFMachPortRef p, void *m, CFIndex size, void *info)
 {
     int result = -1;
-#ifdef MAC_OS_X_VERSION_10_5
     uint64_t nstate;
-#else
-    int nstate;
-#endif
     struct watchedVol *watched;
     int token;
     mach_msg_empty_rcv_t *msg = (mach_msg_empty_rcv_t*)m;
@@ -715,393 +828,413 @@ static void fsys_changed(CFMachPortRef p, void *m, CFIndex size, void *info)
     // msg_id==token -> notify_get_state() -> watchedVol*
     // XX if (token == 0, perhaps a force-rebuild message?)
     token = msg->header.msgh_id;
-    if (notify_get_state(token, &nstate))  goto finish;
+    if (notify_get_state(token, &nstate))   goto finish;
+    // XX should call notify_get_event() here to consume events?
+    // how to know when this notification's events have been consumed?
     watched = (struct watchedVol*)(intptr_t)nstate;
-    if (!watched)  goto finish;
+    if (!watched)   goto finish;
 
     // is the volume valid? (notification should have been canceled)
     if (CFDictionaryGetCountOfValue(sFsysWatchDict, watched)) {
-	CFRunLoopTimerContext tc = { 0, watched, NULL, NULL, NULL };
-	CFAbsoluteTime firetime = CFAbsoluteTimeGetCurrent() + kWatchSettleTime;
+        CFRunLoopTimerContext tc = { 0, watched, NULL, NULL, NULL };
+        CFAbsoluteTime firetime = CFAbsoluteTimeGetCurrent() + kWatchSettleTime;
 
-	// cancel any existing timer (evidently updates are in progress)
-	if (watched->delayer)
-	    CFRunLoopTimerInvalidate(watched->delayer);
+        // cancel any existing timer (evidently updates are in progress)
+        if (watched->delayer)
+            CFRunLoopTimerInvalidate(watched->delayer);
 
-	// schedule a timer to call check_now after a delay
-	watched->delayer=CFRunLoopTimerCreate(nil,firetime,0,0,0,check_now,&tc);
-	if (!watched->delayer)  goto finish;
+        // schedule a timer to call check_now after a delay
+        watched->delayer=CFRunLoopTimerCreate(nil,firetime,0,0,0,check_now,&tc);
+        if (!watched->delayer)      goto finish;
 
-	CFRunLoopAddTimer(CFRunLoopGetCurrent(), watched->delayer,
-	    kCFRunLoopDefaultMode);
-	CFRelease(watched->delayer);  // so later invalidation will free
-    } else
-	kextd_error_log("invalid token/volume: %d, %p", token, watched);
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), watched->delayer,
+            kCFRunLoopDefaultMode);
+        CFRelease(watched->delayer);  // so later invalidation will free
+    } else {
+        kextd_error_log("invalid token/volume: %d, %p", token, watched);
+    }
 
     result = 0;
 
 finish:
     if (result)
-	kextd_error_log("couldn't respond to filesystem change notification!");
+        kextd_error_log("couldn't respond to filesystem change notification!");
 
     return;
 }
 
 /******************************************************************************
  * check_now, called after the timer expires, calls check_rebuild() 
+ * It does not look at errcount because if something changed, we're willing
+ * to look at it again.
  *****************************************************************************/
 void check_now(CFRunLoopTimerRef timer, void *info)
 {
     struct watchedVol *watched = (struct watchedVol*)info;
+    // kextd_log("DEBUG: check_now(%p): entry", info);
 
-    // is the volume still valid? (timer should have been invalidated)
+    // is the volume still being watched?
     if (watched && CFDictionaryGetCountOfValue(sFsysWatchDict, watched)) {
-	watched->delayer = NULL;	 	// timer is no longer pending
-	(void)check_rebuild(watched, false);  	// don't care what it did
-    } /* else
-	kextd_log("DEBUG: timer for %p wasn't invalidated?", watched);
-    */
+        watched->delayer = NULL;        // timer is no longer pending
+        (void)check_rebuild(watched);   // don't care what it did
+    } else {
+        kextd_log("%p's timer fired when it should have been invalid", watched);
+    }
 }
 
 /******************************************************************************
- * check_rebuild (indirectly) stats everything and fires kextcache as needed
- * returns a Boolean indicating whether anything *was* accomplished
+ * returns the result of fork/exec (negative on error; pid on success)
  * a helper returning an error doesn't count (?)
- * - Boolean 'force' allows us to eventually fully handle SIGHUP
- * - fast path: ck_vol_busy->ck_rebuild-> newMKext/timer ->unlock->check/cancel
- * - if any caches are out of date, only rebuild them
- * - otherwise (or always if there was a stat error), copypaths->Apple_Boot's
- * - note: important to only rebuild out-of-date caches to prevent looping
+ * - Boolean 'force' passes -f so that bootstamps are ignored
  *****************************************************************************/
 // kextcache -u helper sets up argv
-static int rebuild_boot(struct bootCaches *caches, Boolean force)
+static pid_t rebuild_all(struct bootCaches *caches, Boolean force)
 {
-    int rval = ELAST + 1;
-    pid_t pid;
+    pid_t rval = -1;
     int argc, argi = 0; 
-    char **kcargs;
+    char **kcargs = NULL;
 
-    //  argv[0] '-u'  root  NULL
-    argc =  1  +  1  + 1  + 1;
+    //  argv[0] '-F'  '-u'  root          -f ?       NULL
+    argc =  1  +  1  +  1  +  1  + (force == true) +  1;
     kcargs = malloc(argc * sizeof(char*));
-    if (!kcargs)  goto finish;
+    if (!kcargs)    goto finish;
 
-    kcargs[argi++] = "kextcache";
-    if (force) {
-	kcargs[argi++] = "-f";
-    }
+    kcargs[argi++] = "/usr/sbin/kextcache";
+    kcargs[argi++] = "-F";      // lower priority within kextcache
+    if (force)
+        kcargs[argi++] = "-f";
     kcargs[argi++] = "-u";
     kcargs[argi++] = caches->root;
     // kextcache reads bc.plist so nothing more needed
 
     kcargs[argi] = NULL;    // terminate the list
 
-    rval = 0;
-    pid = fork_kextcache(caches->root, kcargs, false);
+   /* wait:false means the return value is <0 for fork/exec failures and
+    * the pid of the forked process if >0.
+    */
+    rval = fork_program(kcargs[0], kcargs, 0 /* delay */, false /* wait */);
 
 finish:
-    if (rval) {
-	kextd_error_log("data error before rebuilding boot partition");
-    } else if (pid < 0) {
-	rval = pid;
-    }
+    if (kcargs)     free(kcargs);
+
+    if (rval < 0)
+        kextd_error_log("error launching kextcache -u");
 
     return rval;
 }
 
-/*
- * ?? watched->errcount (tracking cache rebuild problems on a particular volume)
- * could be used to prevent the case where caches are out
- * of date and can't be rebuilt, but we still want to copy stuff to the
- * boot partitions??  Otherwise, we always fire the kextcache -u, but it
- * might beat [regular] kextcache to the lock.
+/******************************************************************************
+ * check_rebuild uses needUpdates() to stat everything and rebuilds as necessary
+ * - kextcache -u used to do all the work (rebuild mkext, boot's etc)
  *
- * That all said, if the mkext is straight up *gone*, we can't do much
- * in the way of rebuilding the data in the boot partition.
- *
- * ... after some testing, it became obvious that repeated attempts at
- * a failling volume would just block reboot.  So we try not to let such a 
- * volume delay reboot for long.
- */
-static Boolean check_rebuild(struct watchedVol *watched, Boolean force)
+ * XX if kextcache is broken (e.g. a copy of 'false'), errcount will never
+ * be incremented -> infiniste reboot stall.  Enforcing a kWatchSettleTime
+ * between launches (even for reboot requests) would mean we could 
+ * reasonably give up after launching five kextcaches and not hearing back.
+ *****************************************************************************/
+static Boolean check_rebuild(struct watchedVol *watched)
 {
     Boolean launched = false;
-    Boolean rebuildmkext = force;	// force the mkext, nuke the stamps
+    Boolean rebuild;
 
     // if we came in some other way and there's a timer pending, cancel it
     if (watched->delayer) {  
-	CFRunLoopTimerInvalidate(watched->delayer);  // runloop holds last ref
-	watched->delayer = NULL;
+        CFRunLoopTimerInvalidate(watched->delayer);  // runloop holds last ref
+        watched->delayer = NULL;
     }
 
-#if 0	// no one calls us with force right now
-    // if forcing, we need to nuke the bootstamps so that kextcache -u 
-    // updates everything after the mkext is rebuilt
-    if (force) {
-        char bspath[PATH_MAX];
+    // stat stuff to see if a rebuild is needed
+    // errcount updated to cap handleRebootHandoff()/checkAllWatched() retries.
+    rebuild = check_mkext(watched->caches);
+    if (!rebuild && watched->isBootRoot) {
+        if (needUpdates(watched->caches, &rebuild, NULL, NULL, NULL)) {
+            watched->errcount++;
+            rebuild = true;
+        }
+    }
 
-        if (snprintf(bspath, PATH_MAX, "%s/%s", watched->caches->root,
-                kTSCacheDir) < PATH_MAX) {
-            if (sdeepunlink(watched->caches->cachefd, bspath)) {
-		kextd_error_log("couldn't nuke bootstamps: %d", errno);
-            }
+    if (rebuild) {
+        if (rebuild_all(watched->caches, false) > 0) {
+            launched = true;
         } else {
-            kextd_error_log("couldn't build Extensions path");
-	}
+            watched->errcount++;
+            kextd_error_log("error launching kextcache -u");
+        }
     }
-#endif
 
-    // might have been forced above
-    if (!rebuildmkext)     rebuildmkext = check_mkext(watched->caches);
-
-    // if we rebuild the mkext this time, we'll be here again on success
-    // because we're watching for changes to the mkext file
-    if (rebuildmkext) {
-	if (rebuild_mkext(watched->caches, false /*wait*/)) {	// logs
-	    watched->errcount++;	// so we don't block reboot forever
-	} else {
-	    launched = true;
-	}
-    } else {
-	// check to see if the volume has helper partitions (and might need -u)
-	char bsdname[DEVMAXPATHSIZE];
-	struct stat sb;
-	CFDictionaryRef binfo = NULL;
-	Boolean hasBoots, isGPT;
-
-	// if not BootRoot, we don't bother with kextcache -u
-	if (fstat(watched->caches->cachefd, &sb) == 0 && 
-		devname_r(sb.st_dev, S_IFBLK, bsdname, DEVMAXPATHSIZE) &&
-		BLCreateBooterInformationDictionary(NULL,bsdname,&binfo) == 0) {
-	    CFArrayRef ar;
-
-	    ar = CFDictionaryGetValue(binfo, kBLAuxiliaryPartitionsKey);
-	    hasBoots = (ar && CFArrayGetCount(ar) > 0);
-	    ar = CFDictionaryGetValue(binfo, kBLSystemPartitionsKey);
-	    isGPT = (ar && CFArrayGetCount(ar) > 0);
-
-	    if (hasBoots && isGPT) {
-		Boolean anyOutOfDate = true;
-		if (needUpdates(watched->caches,&anyOutOfDate,NULL,NULL,NULL)) {
-		    anyOutOfDate = true;
-		}
-
-		// and if necessary, run kextcache -u
-		if (force || anyOutOfDate) {
-		    launched = (rebuild_boot(watched->caches, force) == 0);
-		}
-	    }
-	}
-	if (binfo)	CFRelease(binfo);
+    if (0 == strcmp(watched->caches->root, "/") &&
+        check_plist_cache(watched->caches)) {
+        kextd_handle_signal(SIGHUP);
+        // X someday SIGHUP may call back to rebuild_caches() to force update
     }
 
     return launched;
 }
 
 
-    /* ??? will we track the current root volume to treat it specially?
-    if (rebuildplcache)
-	KXKextManagerResetAllRepositories(gKextManager);  // resets "/"
-    // Extensions.kextcache?
-    if (watched == rootvol) {
-	rebuildplcache = true;  // in case stat() fails
-	if (stat(watched->plcache->rpath, &sb) == -1)
-	    goto cachecheckfailed;
-	rebuildplcache = (sb.st_mtime == extsb.st_mtime + 1);
-    }
-    */
-
 // ---- locking services (prototyped via MiG and kextmanager[_mig].defs) ----
 
 /******************************************************************************
- * kextmanager_lock_reboot locks everything (called by shutdown(8) & reboot(8))
+ * kextmanager_lock_reboot ensures "all clean" (used by shutdown(8), reboot(8))
  *****************************************************************************/
-static int lock_vol(struct watchedVol *watched, mach_port_t client)
-{
-    int rval = ENOMEM;
-    CFRunLoopSourceRef invalidator;
-    CFMachPortContext mp_ctx = { 0, watched, NULL, NULL, NULL };
-    CFRunLoopRef rl = CFRunLoopGetCurrent();
-    if (!rl)  goto finish;
-
-    // create a new lock with the client port
-    watched->lock = CFMachPortCreateWithPort(nil,client,NULL,&mp_ctx,false);
-    if (!watched->lock)  goto finish;
-    CFMachPortSetInvalidationCallBack(watched->lock, lock_died);
-    invalidator = CFMachPortCreateRunLoopSource(nil, watched->lock, 0);
-    if (!invalidator)  goto finish;
-    CFRunLoopAddSource(rl, invalidator, kCFRunLoopDefaultMode);
-    CFRelease(invalidator);	// owned by the runloop now
-
-    rval = 0;
-
-finish:
-    return rval;
-}
-
-#define GIVEUPTHRESH 5
 // iterator helper locking for locked or should-be-locked volumes
 static void check_locked(const void *key, const void *val, void *ctx)
 {
     struct watchedVol *watched = (struct watchedVol*)val;
-    const void **bsdName = ctx;
+    // pointer to the mountpoint_t at the other end
+    char *busyVol = ctx;
 
     // report this one if:
     // it's already locked or if it needs a rebuild
-    // but don't block reboot if it's been having errors
-    if (watched->lock ||
-	    (watched->errcount < GIVEUPTHRESH && check_rebuild(watched, false)))
-	*bsdName = key;
+    // check_vol_busy() ensures checks for excessive errors
+    if (check_vol_busy(watched)) {
+        strlcpy(busyVol, watched->caches->root, MNAMELEN);
+    }
 }
 
-kern_return_t _kextmanager_lock_reboot(mach_port_t p, mach_port_t client,
-				    dev_path_t busyDev, int *busyStatus)
+// create a CFMachPort with invalidation -> port_died
+static CFMachPortRef
+createWatchedPort(mach_port_t mport, void *ctx)
+{
+    CFMachPortRef rval = NULL;
+    int result = ELAST + 1;
+    CFRunLoopSourceRef invalidator;
+    CFMachPortContext mp_ctx = { 0, ctx, 0, };
+    CFRunLoopRef rl = CFRunLoopGetCurrent();
+
+    if(!(rval = CFMachPortCreateWithPort(nil, mport, NULL, &mp_ctx, false)))
+        goto finish;
+    invalidator = CFMachPortCreateRunLoopSource(nil, rval, 0);
+    if (!invalidator)       goto finish;
+    CFMachPortSetInvalidationCallBack(rval, port_died);
+    CFRunLoopAddSource(rl, invalidator, kCFRunLoopDefaultMode);
+    CFRelease(invalidator); // owned by the runloop now
+
+    result = 0;
+
+finish:
+    if (result && rval) {
+        CFRelease(rval);
+        rval = NULL;
+    }
+
+    return rval;
+}
+
+Boolean checkAllWatched(mountpoint_t busyVol)
+{
+    int result;
+
+    // if we've contacted diskarb, scan the dictionary for locked items
+    busyVol[0] = '\0';
+    if (sFsysWatchDict) {
+        CFDictionaryApplyFunction(sFsysWatchDict, check_locked, busyVol);
+    }
+    if (busyVol[0] == '\0') {
+        result = 0;     // you got it!
+    } else {
+        // busyVol (at least) was locked, try again later
+        result = EBUSY;
+    }
+
+    return result;
+}
+
+kern_return_t _kextmanager_lock_reboot(mach_port_t p, mach_port_t replyPort,
+    mach_port_t client, int waitForLock, mountpoint_t busyVol, int *busyStatus)
 {
     kern_return_t rval = KERN_FAILURE;
     int result = ELAST + 1;
-    CFStringRef bsdName = NULL;
+    // kextd_log("DEBUG: _lock_reboot(..%d/%d..)...", client, replyPort);
 
-    if (!busyDev || !busyStatus) {
-	rval = KERN_SUCCESS;
-	result = EINVAL;
-	goto finish;
+    if (!busyStatus) {
+        result = EINVAL;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
     }
-
+    
     if (gClientUID != 0) {
-	kextd_error_log("non-root doesn't need to lock or unlock volumes");
-	rval = KERN_SUCCESS;
-	result = EPERM;
-	goto finish;
+        kextd_error_log("non-root doesn't need to lock for reboot");
+        result = EPERM;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
     }
-
+    
+    // shutdown/reboot proceed on result == EALREADY
     if (sRebootLock) {
-	rval = KERN_SUCCESS;	// for MiG
-	result = EBUSY;	// for the client
-	busyDev[0] = '\0';
-	goto finish;
+        result = EALREADY;
+        rval = KERN_SUCCESS;    // for MiG
+        kextd_log("WARNING: reboot lock request while reboot in progress");
+        goto finish;
     }
 
-    // check to see if any new volumes have become eligible
-    if (reconsiderVolumes(busyDev)) {
-	rval = KERN_SUCCESS;	// for MiG
-	result = EBUSY;	// for the client
-	goto finish;
-    }
-
-    // if we've contacted diskarb, scan the dictionary for locked items
-    if (sFsysWatchDict) {
-	CFDictionaryApplyFunction(sFsysWatchDict, check_locked, &bsdName);
-    }
-    if (bsdName == NULL) {
-	// great, this guy gets to lock everything (which we expect to work)
-	CFRunLoopSourceRef invalidator;
-	CFMachPortContext mp_ctx = { 0, &sRebootLock, 0, };
-	CFRunLoopRef rl = CFRunLoopGetCurrent();
-
-	if (!rl)  goto finish;
-
-	// create a new lock with the client port
-	sRebootLock = CFMachPortCreateWithPort(nil,client,NULL,&mp_ctx,false);
-	if (!sRebootLock)  goto finish;
-	CFMachPortSetInvalidationCallBack(sRebootLock, lock_died);
-	invalidator = CFMachPortCreateRunLoopSource(nil, sRebootLock, 0);
-	if (!invalidator)  goto finish;
-	CFRunLoopAddSource(rl, invalidator, kCFRunLoopDefaultMode);
-	CFRelease(invalidator);	// owned by the runloop now
-
-	result = 0;	    // not locked
+    // check all the volumes we are watching and 
+    // if any new volumes have become eligible
+    if (checkAllWatched(busyVol) || reconsiderVolumes(busyVol)) {
+        result = EBUSY;
+        rval = KERN_SUCCESS;    // for MiG
     } else {
-	// bsdName (at least) was locked, try again later
-	result = EBUSY;
-	if(!CFStringGetFileSystemRepresentation(bsdName, busyDev,
-		DEVMAXPATHSIZE))  busyDev[0] = '\0';
+        // great, this guy gets to take the uber reboot lock
+        if (!(sRebootLock = createWatchedPort(client, &sRebootLock)))
+            goto finish;
+        result = 0;             // success
+        rval = KERN_SUCCESS;    // for MiG
     }
 
-    rval = KERN_SUCCESS;
+    // should we reply now or later?
+    if (waitForLock && result == EBUSY && sRebootWaiter == NULL) {
+        // client will block until we reply with lock or failure
+        // [&sRebootLock is context for all interested in the reboot lock]
+        if (!(sRebootWaiter = createWatchedPort(client, &sRebootLock)))
+            goto finish;
+
+        // stash reply port so we can get it later (X someday dual-use port?)
+        CFDictionarySetValue(sReplyPorts, sRebootWaiter, (void*)replyPort);
+        rval = MIG_NO_REPLY;    // for MiG; no result
+    } else {
+        // we reply to the client if: a. failure other than EBUSY,
+        // b. the client won't wait, or c. we've no way to track him.
+        rval = KERN_SUCCESS;        // MiG will return to the caller
+    }
 
 finish:
     if (rval == KERN_SUCCESS) {
-	*busyStatus = result;
-    } else {
-	kextd_error_log("error locking for reboot");
+        *busyStatus = result;
+    } else if (rval != MIG_NO_REPLY) {
+        kextd_error_log("error %d locking for reboot", rval);
     }
 
-    if (result == EBUSY && bsdName)
-	kextd_log("%s was busy, preventing lock for reboot", busyDev);
+    // pop up a dialog if reboot is going to stall
+    if (result == EBUSY && waitForLock) {
+        CFMutableArrayRef msg;
+        kextd_log("'%s' updating, delaying reboot", busyVol);
+
+        if((msg = CFArrayCreateMutable(nil, 1, &kCFTypeArrayCallBacks))) {
+            CFArrayAppendValue(msg, CFSTR(
+                "Caches necessary for booting are being updated.  "
+                "System shutdown will proceed once the caches are up to date."
+                ));
+            kextd_raise_notification(CFSTR("Updating Boot Caches"), msg);
+            CFRelease(msg);
+        }
+    }
 
     return rval;
 }
 
 /******************************************************************************
- * _kextmanager_lock_volume tries to lock volumes for clients (i.e. kextcache)
- * - volDev is the "bsdName" of the volume in question
+ * _kextmanager_lock_volume locks volumes for kextcache
+ * - vol_uuid is in CFUUIDBytes
  *****************************************************************************/
-kern_return_t _kextmanager_lock_volume(mach_port_t p, mach_port_t client,
-				    dev_path_t volDev, int *lockstatus)
+kern_return_t _kextmanager_lock_volume(mach_port_t p, mach_port_t replyPort,
+    mach_port_t client, uuid_t vol_uuid, int waitForLock, int *lockStatus)
 {
     kern_return_t rval = KERN_FAILURE;
     int result;
-    CFStringRef bsdName = NULL;
+    CFUUIDBytes uuidBytes;
+    CFUUIDRef volUUID = NULL;
     struct watchedVol *watched = NULL;
     struct statfs sfs;
+    // kextd_log("DEBUG: _lock_volume(..%d..)...", client);
 
-    if (!lockstatus) {
-	kextd_error_log("kextmanager_lock_volume requires lockstatus != NULL");
-	rval = KERN_SUCCESS;
-	result = EINVAL;
+    if (!lockStatus) {
+        kextd_error_log("kextmanager_lock_volume requires lockStatus != NULL");
+        result = EINVAL;
+        rval = KERN_SUCCESS;    // for MiG
     }
 
     if (gClientUID != 0 /*watched->fsinfo->f_owner ?*/) {
-	kextd_error_log("non-root doesn't need to lock or unlock volumes");
-	rval = KERN_SUCCESS;
-	result = EPERM;
-	goto finish;
+        kextd_error_log("non-root doesn't need to lock or unlock volumes");
+        result = EPERM;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
     }
 
-    // if we're still trying to initialize or we're rebooting,
-    // deny any new locks
-    if (!sFsysWatchDict || sRebootLock) {
-	rval = KERN_SUCCESS;	// for MiG
-	result = EBUSY;	// for the client
-	goto finish;
+    // still initializing; sorry (XX someday could allow you to wait)
+    if (!sFsysWatchDict) {
+        result = EAGAIN;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
+    }
+
+    // still initializing / rebooting -> client not getting the lock
+    if (sRebootLock) {
+        result = ENOLCK;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
     }
 
     result = ENOMEM;
-    bsdName = CFStringCreateWithFileSystemRepresentation(nil, volDev);
-    if (!bsdName)  goto finish;
-    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName);
+    memcpy(&uuidBytes.byte0, vol_uuid, sizeof(uuid_t));
+    volUUID = CFUUIDCreateFromUUIDBytes(nil, uuidBytes);
+    if (!volUUID)   goto finish;
+    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, volUUID);
     if (!watched) {
-	rval = KERN_SUCCESS;
-	result = ENOENT;
-	goto finish;
+        result = ENOENT;
+        rval = KERN_SUCCESS;    // for MiG
+        goto finish;
     }
 
-    if (watched->lock) {
-	// kextd_log("DEBUG: volume %s locked", watched->caches->root);
-	result = EBUSY;
+    // if not locked, grant the lock
+    if (watched->lock == NULL) {
+        // take lock
+        if (!(watched->lock = createWatchedPort(client, watched))) {
+            goto finish;
+        }
+        // try to enable owners if not currently honored (XX ignore failure?)
+        if (statfs(watched->caches->root, &sfs) == 0 &&
+                (sfs.f_flags & MNT_IGNORE_OWNERSHIP)) {
+            toggleOwners(watched->caches->root, true);      // logs errors
+            watched->disableOwners = true;
+        }
+        result = 0;             // success; lock granted
+        rval = KERN_SUCCESS;    // for MiG
     } else {
-	if (lock_vol(watched, client))  goto finish;
-	result = 0;
+        // lock can't be granted; let the client wait if willing
+        if (waitForLock) {
+            rval = MIG_NO_REPLY;    // for MiG; no result
+        } else {
+            result = EBUSY;         // for client
+            rval = KERN_SUCCESS;    // for MiG
+        }
     }
 
-    // try to enable owners if not currently honored
-    if (statfs(watched->caches->root, &sfs) == 0 &&
-	    (sfs.f_flags & MNT_IGNORE_OWNERSHIP)) {
-	toggleOwners(volDev, true);
-	watched->disableOwners = true;
+    // if we're not replying yet, so add client to the wait queue
+    if (rval == MIG_NO_REPLY) {
+        CFMachPortRef waiter;
+
+        // create waiter array (of CFMachPortRefs) if needed
+        if (!watched->waiters) {
+            watched->waiters=CFArrayCreateMutable(0,1,&kCFTypeArrayCallBacks);
+            if (!watched->waiters) {
+                rval = KERN_FAILURE;
+                goto finish;
+            }
+        }
+
+        // create waiter and insert into array
+        if (!(waiter = createWatchedPort(client, watched))) {
+            rval = KERN_FAILURE;
+            goto finish;
+        }
+
+        // store waiter, replyPort; cleanupPort releases waiter create above
+        CFArrayAppendValue(watched->waiters, waiter);
+        CFDictionarySetValue(sReplyPorts, waiter, (void*)replyPort);
+
+        // success: rval remains MIG_NO_REPLY
     }
 
-    rval = KERN_SUCCESS;
 
 finish:
-    if (bsdName)  CFRelease(bsdName);
-    if (rval) {
-	if (gClientUID == 0)
-	    kextd_error_log("trouble while locking %s", volDev);
-	cleanupLock(watched->lock);
-    } else {
-	*lockstatus = result;	    // only meaningful on rval == 0
-    }
+    if (volUUID)  CFRelease(volUUID);
+
+    if (rval == KERN_SUCCESS) {
+        *lockStatus = result;
+    } else if (rval != MIG_NO_REPLY && result != EPERM) {
+        kextd_error_log("error %d locking '%s'", rval, watched->caches->root);
+        cleanupPort(&watched->lock);
+    } 
 
     return rval;
 }
@@ -1110,198 +1243,269 @@ finish:
  * _kextmanager_unlock_volume unlocks for clients (i.e. kextcache)
  *****************************************************************************/
 kern_return_t _kextmanager_unlock_volume(mach_port_t p, mach_port_t client,
-				    dev_path_t volDev, int exitstatus)
+    uuid_t vol_uuid, int exitstatus)
 {
     kern_return_t rval = KERN_FAILURE;
-    CFStringRef bsdName = NULL;
+    CFUUIDRef volUUID = NULL;
     struct watchedVol *watched = NULL;
+    CFUUIDBytes uuidBytes;
+    // kextd_log("DEBUG: _kextmanager_unlock_volume()...");
 
-    // since we don't need the extra send right added by MiG
+    // since we don't need the extra send right added by MiG (XX why?)
     if (mach_port_deallocate(mach_task_self(), client))  goto finish;
 
     if (gClientUID != 0 /*watched->fsinfo->f_owner ?*/) {
-	kextd_error_log("non-root doesn't need to lock or unlock volumes");
-	rval = KERN_SUCCESS;
-	goto finish;
+        kextd_error_log("non-root doesn't need to lock or unlock volumes");
+        rval = KERN_SUCCESS;
+        goto finish;
     }
 
     // make sure we're set up
     if (!sFsysWatchDict)    goto finish;
 
-    bsdName = CFStringCreateWithFileSystemRepresentation(nil, volDev);
-    if (!bsdName)  goto finish;
-    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName);
-    if (!watched)  goto finish;
+    memcpy(&uuidBytes.byte0, vol_uuid, sizeof(uuid_t));
+    volUUID = CFUUIDCreateFromUUIDBytes(nil, uuidBytes);
+    if (!volUUID)           goto finish;
+    watched = (void*)CFDictionaryGetValue(sFsysWatchDict, volUUID);
+    if (!watched)           goto finish;
 
     if (!watched->lock) {
-	kextd_error_log("%s isn't locked", watched->caches->root);
-	goto finish;
+        kextd_error_log("'%s' isn't locked", watched->caches->root);
+        goto finish;
     }
     
     if (client != CFMachPortGetPort(watched->lock)) {
-	kextd_error_log("%p not used to lock %s", client,
-		watched->caches->root);
-	goto finish;
+        kextd_error_log("%d didn't lock '%s'", client, watched->caches->root);
+        goto finish;
     }
 
     // okay, recording any error and releasing the lock
     if (exitstatus) {
-	if (exitstatus == EX_TEMPFAIL) {
-	    // kextcache not done yet; so don't record error
-	} else {
-	    kextd_log("kextcache reported a problem updating %s", volDev);
-	    watched->errcount++;
-	}
-    } else if (watched->errcount) {
-	// put reassuring message in the log
-	kextd_log("kextcache succeeded with %s (previously failed)", volDev);
-	watched->errcount = 0;
+        watched->errcount++;
+        kextd_log("kextcache error updating %s (error count: %d)",
+            watched->caches->root, watched->errcount);
+    } else {
+        if (watched->errcount > 0) {
+            // put reassuring message in the log
+            kextd_log("kextcache succeeded with '%s' (previously failed)",
+                watched->caches->root);
+            watched->errcount = 0;
+        }
     }
  
     // disable owners if we enabled them for the locker
     if (watched->disableOwners) {
-	toggleOwners(volDev, false);
-	watched->disableOwners = false;
+        toggleOwners(watched->caches->root, false);     // logs errors
+        watched->disableOwners = false;
     }
 
-    cleanupLock(watched->lock);
+    // if kextcache failed, handleRebootHandoff() will fire off another
+    // but only if errcount is less than the failure limit
+    handleWatchedHandoff(watched);
+    if (!sRebootLock && sRebootWaiter)
+        handleRebootHandoff();
 
-    /* could try to speed things along (-m to -u; 5 seconds faster at shutdown)
-     * disabled with mutli-lock/unlock for owners; check EX_TEMPFAIL in Leopard
-     if (watched->errcount < GIVEUPTHRESH)
-	(void)check_rebuild(watched, false);
-     */
+    // once upon a time, we thought we could save five seconds here
+    // instead, we will just call kextcache -u and it will build the mkext
 
     rval = KERN_SUCCESS;
 
 finish:
-    if (bsdName)  CFRelease(bsdName);
+    if (volUUID)    CFRelease(volUUID);
     if (rval && watched) {
-	kextd_error_log("couldn't unlock %s", watched->caches->root);
+        kextd_error_log("couldn't unlock '%s'", watched->caches->root);
     }
 
     return rval;
 }
 
+/* {
+mach_port_urefs_t refs = 0xff;
+kextd_log("DEBUG: mach_port_get_refs(..%d, send..): %x -> %x ref(s)", client,
+mach_port_get_refs(mach_task_self(), client, MACH_PORT_RIGHT_SEND, &refs),refs);
+} */
+
+
 /******************************************************************************
- * lock_died tells us when the receive right went away
- * - this is okay if we're currently unlocked; bad otherwise
- *****************************************************************************/
-static void lock_died(CFMachPortRef p, void *info)
+* port_died() tells us when a tracked send right goes away.
+* We track send rights (on the client ports passed to us) as long as we
+* have resources allocated to those clients.  If they die, we get notified
+* that the send right went away and then we clean up the associated resource.
+*
+* This function should only be called when shutdown/reboot exits before kextd
+* or when a kextcache process is terminated against its will.
+*
+* If the client explicitly deallocates its *receive* right / port while we are
+* tracking the corresponding send right, port_died() is also called, though
+* kextcache should unlock the volume before doing that.
+*****************************************************************************/
+static void port_died(CFMachPortRef cfport, void *info)
 {
-    struct watchedVol* watched = (struct watchedVol*)info;
+    mach_port_t mport = cfport ? CFMachPortGetPort(cfport) : MACH_PORT_NULL;
+    struct watchedVol* watched;
+    // kextd_log("DEBUG: port_died(%p/%d): entry", cfport, mport);
 
-    if (info == &sRebootLock) {
-	kextd_log("reboot/shutdown should have rebooted instead of dying");
-	cleanupLock(sRebootLock);   // there is explicit releasing this lock
-    } else if (!watched) {
-	kextd_error_log("lock_died: NULL info??");
-    } else if (CFDictionaryGetCountOfValue(sFsysWatchDict, watched) == 0) {
-	// volume might have been renamed while in action (4620558)
-	// kextd_log("no container for invalid lock"); // expected via vol_gone?
-    } else if (watched->lock) {
-	kextd_error_log("child exited w/o releasing lock on %s",
-		watched->caches->root);
- 
-	// try to disable owners if we enabled them for the locker
-	if (watched->disableOwners) {
-	    struct statfs sfs;
-	    char *bsdname;
-
-	    if (statfs(watched->caches->root, &sfs) == 0 &&
-	    	    (bsdname = strstr(sfs.f_mntfromname, "disk"))) {
-		toggleOwners(bsdname, false);
-		watched->disableOwners = false;
-	    }
-	}
-
-	cleanupLock(watched->lock);
-	// could clean up worker pid if we were actually storing it
+    // all watched-associated ports should have context
+    if (!info || !cfport) {
+        kextd_error_log("port_died() fatal error: invalid data");
+        goto finish;
     }
-    /*else {
-	// kextd_log("DEBUG: lock (cleanly) deallocated for %s",
-		watched->caches->root);
-    }*/
+
+
+    // only means of release for reboot lock
+    if (info == &sRebootLock) {
+        if (cfport == sRebootLock) {
+            // reboot/shutdown happened to exit before kextd
+            // XX start timer now or when reboot lock granted?
+            cleanupPort(&sRebootLock);
+        } else if (cfport == sRebootWaiter) {
+            cleanupPort(&sRebootWaiter);        // gave up waiting
+        } else {
+            kextd_error_log("improperly tracked shutdown/reboot process died");
+        }
+        goto finish;
+    }
+
+
+    // else ... handle volume lockers and waiters
+
+    watched = (struct watchedVol*)info;
+
+    // vol_disappeared() removes the volume from sFsysWatchDict before
+    // cleaning up all the waiters, so unless the runloop somehow jumped
+    // over here from the midst of that callout, no ports affiliated
+    // with missing watchVol*'s should be dying.  Even multiple
+    // reboot waiters would all have the same context and the mach
+    // port check above would catch them.
+    if (CFDictionaryGetCountOfValue(sFsysWatchDict, watched) == 0) {
+        kextd_error_log("WARNING: missing context for deallocated helper port");
+        cleanupPort(&cfport);
+        goto finish;
+    }
+
+    // watched points to valid data ... was it the locker?
+    if (watched->lock && mport == CFMachPortGetPort(watched->lock)) {
+        // try to disable owners if we enabled them for the locker
+        if (watched->disableOwners) {
+            toggleOwners(watched->caches->root, false);  // logs errors
+            watched->disableOwners = false;
+        }
+        
+        // if locked, is anyone waiting?
+        if (watched->lock) {
+            kextd_error_log("%p exited without unlocking '%s'",
+                            watched->lock, watched->caches->root);
+            handleWatchedHandoff(watched);      // cleans up watched->lock
+            if (!sRebootLock && sRebootWaiter)
+                handleRebootHandoff();
+        }
+        // if we were storing the worker pid, we'd clean it up here
+
+    } else {    // it must have been a waiter
+        CFIndex i;
+        if (!watched->waiters) {
+            kextd_log("WARNING: presumed waiter died, but no waiters");
+            goto finish;
+        }
+
+        for (i = CFArrayGetCount(watched->waiters); i-- > 0;) {
+            CFMachPortRef waiter; 
+
+            waiter = (CFMachPortRef)CFArrayGetValueAtIndex(watched->waiters,i);
+            if (mport == CFMachPortGetPort(waiter)) {
+                cleanupPort(&waiter);       // --retainCount
+                CFArrayRemoveValueAtIndex(watched->waiters, i); // release
+                goto finish;      // success
+            }
+        }
+
+        kextd_log("WARNING: %s: unknown helper exited", watched->caches->root);
+    }
+
+finish:
+    return;
 }
 
 /******************************************************************************
- * reconsiderVolume() rechecks to see if a volume has become interesting
- * given that we watch owners-ignored volumes, only needed for OS copies
+ * reconsiderVolume() rechecks to see if a volume has become interesting.
+ * Given that we watch owners-ignored volumes, reconsiderVolume() should
+ * only be needed for OS copies.
  *****************************************************************************/
-static Boolean reconsiderVolume(dev_path_t volDev)
+static Boolean reconsiderVolume(mountpoint_t volToCheck)
 {
-    int result = -1;
+    int result = 0;
     Boolean rval = false;
-    CFStringRef bsdName = NULL;
-    struct watchedVol *watched;
     DADiskRef disk = NULL;
+    CFDictionaryRef dadesc = NULL;
+    CFUUIDRef volUUID;
 
-    bsdName = CFStringCreateWithCString(nil, volDev, kCFStringEncodingASCII);
-    if (!bsdName)	goto finish;
+    // if unknown to diskarb, we don't care
+    disk = createDiskForMount(sDASession, volToCheck);
+    if (!disk)      goto finish;
 
-    // lock_reboot will shortly call check_rebuild on all watched volumes
-    if (!CFDictionaryGetValue(sFsysWatchDict, bsdName)) {
-	if (!(disk = DADiskCreateFromBSDName(nil, sDASession, volDev)))
-	    goto finish;
+    result = -1;
+    dadesc = DADiskCopyDescription(disk);
+    if (!dadesc)    goto finish;
+    volUUID = CFDictionaryGetValue(dadesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID)   goto finish;
 
-	// maybe we should be watching it now?
-	vol_appeared(disk, NULL);
-	if ((watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName))) {
-	    rval = check_rebuild(watched, false);   // vol_appeared calling too
-	}
+    // if not watched, add to watch dict / start rebuild (rval = didLaunch)
+    if (!CFDictionaryGetValue(sFsysWatchDict, volUUID)) {
+        vol_appeared(disk, &rval);
     }
 
     result = 0;
 
 finish:
-    if (disk)	    CFRelease(disk);
-    if (bsdName)    CFRelease(bsdName);
+    if (disk)       CFRelease(disk);
+    if (dadesc)     CFRelease(dadesc);
     if (result) {
-	kextd_error_log("error reconsidering volume %d");
+        kextd_error_log("error reconsidering volume %s", volToCheck);
     }
 
     return rval;
 }
 
 /******************************************************************************
- * reconsiderVolumes() iterates the mount list, reconsidering all local mounts
- * if any one of them needed an update, busyDev is set to the disk in question
+ * reconsiderVolumes() iterates the mount list, reconsidering all local mounts.
+ * reconsiderVolume() calls vol_appeared on any we aren't yet watching.
+ * If any newly added one needed an update, busyVol is set to its mountpoint.
  *****************************************************************************/
-static Boolean reconsiderVolumes(dev_path_t busyDev)
+static Boolean reconsiderVolumes(mountpoint_t busyVol)
 {
     Boolean rval = false;
     char *errmsg = NULL;
     int nfsys, i;
     size_t bufsz;
-    struct statfs *mounts;
-    char *bsdname;
+    struct statfs *mounts = NULL;
 
     // if not set up ...
-    if (!sDASession)	    goto finish;
+    if (!sDASession)        goto finish;
 
     errmsg = "error while getting mount list";
-    if (-1 == (nfsys = getfsstat(NULL, 0, 0)))	    goto finish;
+    if (-1 == (nfsys = getfsstat(NULL, 0, 0)))      goto finish;
     bufsz = nfsys * sizeof(struct statfs);
-    if (!(mounts = malloc(bufsz)))	    	    goto finish;
+    if (!(mounts = malloc(bufsz)))                  goto finish;
     if (-1 == getfsstat(mounts, bufsz, MNT_NOWAIT)) goto finish;
 
-    errmsg = NULL;	// let reconsiderVolume() take it from here
+    errmsg = NULL;  // let reconsiderVolume() take it from here
     for (i = 0; i < nfsys; i++) {
-	struct statfs *sfs = &mounts[i];
+        struct statfs *sfs = &mounts[i];
 
-	if (sfs->f_flags & MNT_LOCAL &&
-	       (bsdname = strstr(sfs->f_mntfromname, "disk"))) {
-	    if (reconsiderVolume(bsdname)) {
-		rval = true;
-		strlcpy(busyDev, bsdname, DEVMAXPATHSIZE);
-	    }
-	}
+        if (sfs->f_flags & MNT_LOCAL && strcmp(sfs->f_fstypename, "devfs")) {
+            if (reconsiderVolume(sfs->f_mntonname) && !rval) {
+                // only capture first volume, but check them all
+                strlcpy(busyVol, sfs->f_mntonname, MNAMELEN);
+                rval = true;
+            }
+        }
     }
 
     errmsg = NULL;
 
 finish:
     if (errmsg)     kextd_error_log(errmsg);
+    if (mounts)     free(mounts);
 
     return rval;
 }
@@ -1309,43 +1513,47 @@ finish:
 /******************************************************************************
  * toggleOwners() enables or disables owners as requested
  *****************************************************************************/
-static void toggleOwners(dev_path_t volDev, Boolean enableOwners)
+static void toggleOwners(mountpoint_t mount, Boolean enableOwners)
 {
     int result = ELAST + 1;
     DASessionRef session = NULL;
     CFStringRef toggleMode = CFSTR("toggleOwnersMode");
+    CFURLRef volURL;
     DADiskRef disk = NULL;
     DADissenterRef dis = (void*)kCFNull;
     CFStringRef mountargs[] = { CFSTR("update"), NULL,  NULL };
 
     if (enableOwners) {
-	mountargs[1] = CFSTR("perm");
+        mountargs[1] = CFSTR("owners");
     } else {
-	mountargs[1] = CFSTR("noperm");
+        mountargs[1] = CFSTR("noowners");
     }
 
     // same 'dis' logic as mountBoot in update_boot.c
-    if (!(session = DASessionCreate(nil)))  	goto finish;
+    if (!(session = DASessionCreate(nil)))      goto finish;
     DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(), toggleMode);
-    if (!(disk = DADiskCreateFromBSDName(nil, session, volDev))) goto finish;
+    volURL=CFURLCreateFromFileSystemRepresentation(nil,(void*)mount,MNAMELEN,1);
+    if (!(volURL))      goto finish;
+    if (!(disk = DADiskCreateFromVolumePath(nil, session, volURL))) goto finish;
     DADiskMountWithArguments(disk, NULL, kDADiskMountOptionDefault, _daDone,
-				 &dis, mountargs);
+                             &dis, mountargs);
 
     while (dis == (void*)kCFNull) {
-	CFRunLoopRunInMode(toggleMode, 0, true);    // _daDone updates 'dis'
+        CFRunLoopRunInMode(toggleMode, 0, true);    // _daDone updates 'dis'
     }
-    if (dis) 	goto finish;
+    if (dis)    goto finish;
 
     result = 0;
 
 finish:
-    if (dis && dis != (void*)kCFNull) 	    CFRelease(dis);
-    if (disk)	    			    CFRelease(disk);
-    if (session)			    CFRelease(session);
+    if (dis && dis != (void*)kCFNull)   CFRelease(dis);
+    if (disk)                           CFRelease(disk);
+    if (session)                        CFRelease(session);
 
-    if (result)
-	kextd_log("WARNING: couldn't %s owners for %s", 
-		enableOwners ? "enable":"disable", volDev);
+    if (result) {
+        kextd_log("WARNING: couldn't %s owners for %s", 
+            enableOwners ? "enable":"disable", mount);
+    }
 }
 
 /*******************************************************************************
@@ -1403,7 +1611,7 @@ void updateRAIDSet(
     CFDictionarySetValue(matchingDict, CFSTR(kIOPropertyMatchKey), 
         matchPropertyDict);
 
-    errorMessage = NULL;	// maybe the RAID just went away
+    errorMessage = NULL;    // maybe the RAID just went away
     theRAIDSet  = IOServiceGetMatchingService(kIOMasterPortDefault,
         matchingDict);
     matchingDict = NULL;  // IOServiceGetMatchingService() consumes reference!
@@ -1422,7 +1630,7 @@ void updateRAIDSet(
 
     watched = (void*)CFDictionaryGetValue(sFsysWatchDict, bsdName);
     if (watched) {
-        (void)rebuild_boot(watched->caches, true /* force rebuild */);
+        (void)rebuild_all(watched->caches, true /* force rebuild */);
     }
 
     errorMessage = NULL;

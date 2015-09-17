@@ -1,14 +1,36 @@
+/*
+ * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFBundlePriv.h>
 #include <err.h>    	// warn[x]
 #include <errno.h>
 #include <libc.h>
-#include <stdlib.h> 	// devname()
 #include <libgen.h>	// dirname()
 #include <Kernel/libsa/mkext.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <fts.h>
+#include <paths.h>
 #include <mach-o/arch.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
@@ -21,10 +43,10 @@
 #include <mach/kmod.h>
 #include <servers/bootstrap.h>	// bootstrap mach ports
 #include <unistd.h>		// sleep(3)
+#include <sys/types.h>
+#include <sys/stat.h>
 
-
-#include <IOKit/kext/KXKextManager.h>
-#include <IOKit/kext/kextmanager_types.h>
+#include <DiskArbitration/DiskArbitrationPrivate.h>
 #include <IOKit/IOTypes.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOKitServer.h>
@@ -32,36 +54,34 @@
 #include <IOKit/IOCFSerialize.h>
 #include <libkern/OSByteOrder.h>
 
-#include "bootroot.h"
+#include <IOKit/kext/KXKextManager.h>
+#include <IOKit/kext/kextmanager_types.h>
+#include <IOKit/kext/kextmanager_mig.h>
+#include <IOKit/kext/kernel_check.h>
+#include <bootfiles.h>
+
+#include "bootcaches.h"
 #include "update_boot.h"
+#include "utility.h"
+#include "logging.h"
 
-// XX need to export kextmanager.h from IOKitUser
-// #include "kextmanager.h"	// since we didn't want to generate a .c file
-kern_return_t kextmanager_lock_volume(mach_port_t p,
-			    mach_port_t client, char *volDev, int *lockstatus);
-kern_return_t kextmanager_unlock_volume(mach_port_t p,
-			    mach_port_t client, char *volDev, int result);
-
-
-// XX: switch to bootfiles.h when we get the chance
-#define DEFAULT_CACHE_DIR	"/System/Library/Caches/com.apple.kernelcaches"
+// constants
 #define SA_HAS_RUN_PATH		"/var/db/.AppleSetupDone"
 #define kKXROMExtensionsFolder  "/System/Library/Caches/com.apple.romextensions/"
-#define TEMP_DIR		"/com.apple.iokit.kextcache.mkext.XX"
+#define MKEXT_PERMS             (0644)
 
-#define LCK_MAXTRIES 10
-#define LCK_DELAY    30 	// up to five minutes of waiting
 
 /*******************************************************************************
 * Program Globals
 *******************************************************************************/
-char * progname = "(unknown)";
+const char * progname = "(unknown)";
 
 /*******************************************************************************
 * File-Globals
 *******************************************************************************/
-static mach_port_t sLockPort = nil;
-static mach_port_t sKextdPort = nil;
+static mach_port_t sLockPort = MACH_PORT_NULL;
+static uuid_t s_vol_uuid;
+static mach_port_t sKextdPort = MACH_PORT_NULL;
 
 /*******************************************************************************
 * Extern functions.
@@ -87,7 +107,7 @@ ssize_t createMkextArchive(
     cpu_type_t archCPU,
     cpu_subtype_t archSubtype,
     int verbose_level);
-Boolean checkMkextArchiveSize( ssize_t size );
+Boolean mkextArchiveSizeOverLimit(ssize_t size, cpu_type_t cpuType);
 
 // in prelink.c
 KXKextManagerError
@@ -105,7 +125,6 @@ PreLink(KXKextManagerRef theKextManager, CFDictionaryRef kextDict,
 /*******************************************************************************
 * Utility and callback functions.
 *******************************************************************************/
-char * CFURLCopyCString(CFURLRef anURL);
 static void addKextForMkextCache(
     KXKextRef theKext,
     CFMutableDictionaryRef checkDictionary,
@@ -129,24 +148,11 @@ static void collectKextsForMkextCache(
     int verbose_level,
     Boolean do_tests);
 
-// locking: "put" and "take" indicate that routines decide if a lock is needed
-// int takeVolumeForPaths(char *volPath, int filec, const char *files[]);
+// put/take helpers
 static int takeVolumeForPath(const char *path);
-static int takeVolume(dev_t devid);
-// static int putVolumeForPath(const char *path, int status);
 
-__private_extern__ void verbose_log(const char * format, ...);
-static void error_log(const char * format, ...);
-static int user_approve(int default_answer, const char * format, ...);
-static const char * user_input(const char * format, ...);
-static Boolean addKextsToManager(
-    KXKextManagerRef aManager,
-    CFArrayRef kextNames,
-    CFMutableArrayRef kextNamesToUse,
-    Boolean do_tests);
 static void get_catalog_demand_lists(CFMutableSetRef * kernel_requests,
-				      CFSetRef * kernel_cache_misses,
-				      int verbose_level);
+				      CFSetRef * kernel_cache_misses);
 static void usage(int level);
 
 #define kMaxArchs 64
@@ -155,12 +161,16 @@ static void usage(int level);
 /*******************************************************************************
 *******************************************************************************/
 
+// so utility.c can get at it
+int g_verbose_level = kKXKextManagerLogLevelDefault;  // -v
+
 int main(int argc, const char * argv[])
 {
     int exit_code = 0;
     int optchar;
     KXKextManagerRef theKextManager = NULL;  // must release
     KXKextManagerError result;
+    mode_t             real_umask;
 
     CFIndex i, count;
 
@@ -187,15 +197,14 @@ int main(int argc, const char * argv[])
     Boolean cache_looks_uptodate = false;
     Boolean debug_mode = false;		     // -d
     Boolean forceUpdate = false;             // -f
-    char *updateRoot = NULL;		     // -u
-    int verbose_level = 0;		     // -v
-    const char * default_kernel_file = "/mach_kernel";
-    const char * kernel_file = default_kernel_file;  // overriden by -K option
-    const char * source_extensions    = "/System/Library/Extensions";
+    char *updateRoot = NULL;		     // -u/-U
+    Boolean expectUpToDate = false;          // -U
+    const char * default_kernel_file = kDefaultKernel;
+    const char * kernel_file = NULL;  // overriden by -K option
+    const char * source_extensions    = kSystemExtensionsDir;
     int fd = -1;
     const char * output_filename = NULL;
-    const char * temp_dir;
-    char * temp_file = NULL;
+    char temp_file[MAXPATHLEN];
 
     struct stat kernel_stat_buf;
     struct stat extensions_stat_buf;
@@ -213,10 +222,13 @@ int main(int argc, const char * argv[])
     Boolean all_plists;
 
     // -a for these three
+    Boolean explicit_arch = false;  // if any -a used
     NXArchInfo archAny = {
-        "any",
-        CPU_TYPE_ANY,
-        CPU_SUBTYPE_MULTIPLE
+        .name = "any",
+        .cputype = CPU_TYPE_ANY,
+        .cpusubtype = CPU_SUBTYPE_MULTIPLE,
+        .byteorder = NX_UnknownByteOrder,
+        .description = "any"
     };
 
     CFMutableArrayRef repositoryDirectories = NULL;  // must release
@@ -383,7 +395,7 @@ int main(int argc, const char * argv[])
     * the new mode, process the new, larger set of options.
     */
     while ((optchar = getopt(argc, (char * const *)argv,
-               "a:cdefFhkK:lLm:nNrsStu:vz")) != -1) {
+               "a:cdefFhkK:lLm:nNrsStu:U:vz")) != -1) {
 
         switch (optchar) {
 
@@ -400,16 +412,28 @@ int main(int argc, const char * argv[])
                 exit_code = 1;
                 goto finish;
             }
+            explicit_arch = true;
             ++nArchs;
             break;
 
-          case 'r':
-	    include_kernel_requests = true;
-	    break;
+          case 'c':
+            if (kernelCacheFilename) {
+                fprintf(stderr, "an output filename has already been set\n\n");
+                usage(0);
+                exit_code = 1;
+                goto finish;
+            }
+
+            if (optind >= argc) {
+                need_default_kernelcache_info = true;
+            } else {
+                kernelCacheFilename = argv[optind++];
+            }
+            break;
 
           case 'd':
-	    debug_mode = true;
-	    break;
+            debug_mode = true;
+            break;
 
           case 'e':
             if (mkextFilename) {
@@ -422,9 +446,18 @@ int main(int argc, const char * argv[])
             CFArrayAppendValue(repositoryDirectories, kKXSystemExtensionsFolder);
             break;
 
+          case 'f':
+            forceUpdate = true;
+            break;
+
           case 'F':
             forkExit = true;
             break;
+
+          case 'h':
+            usage(2);
+            exit_code = 0;
+            goto finish;
 
           case 'K':
             kernel_file = optarg;
@@ -440,21 +473,6 @@ int main(int argc, const char * argv[])
 
           case 'L':
             local_for_all = true;
-            break;
-
-          case 'c':
-            if (kernelCacheFilename) {
-                fprintf(stderr, "an output filename has already been set\n\n");
-                usage(0);
-                exit_code = 1;
-                goto finish;
-            }
-
-	    if (optind >= argc) {
-                need_default_kernelcache_info = true;
-	    } else {
-		kernelCacheFilename = argv[optind++];
-	    }
             break;
 
           case 'm':
@@ -475,6 +493,9 @@ int main(int argc, const char * argv[])
             network_for_all = true;
             break;
 
+          case 'r':
+	        include_kernel_requests = true;
+	        break;
 
           case 's':
             safeboot_for_repositories = true;
@@ -488,26 +509,32 @@ int main(int argc, const char * argv[])
             do_tests = true;
             break;
 
-	  case 'u':
-	    updateRoot = optarg;
-	    break;
+          case 'u':
+          case 'U':
+            if (updateRoot) {
+                fprintf(stderr, "a volume to update has already been set\n\n");
+                usage(0);
+                exit_code = 1;
+                goto finish;
+            }
+            updateRoot = optarg;
+            if (optchar == 'U') {
+                expectUpToDate = true;
+            }
+            break;
 	  
-	  case 'f':
-	    forceUpdate = true;
-	    break;
-
           case 'v':
             {
                 const char * next;
 
-                if (verbose_level > 0) {
+                if (g_verbose_level > kKXKextManagerLogLevelDefault) {
                     fprintf(stderr, "duplicate use of -v option\n\n");
                     usage(0);
                     exit_code = 1;
                     goto finish;
                 }
                 if (optind >= argc) {
-                    verbose_level = 1;
+                    g_verbose_level = kKXKextManagerLogLevelBasic;
                 } else {
                     next = argv[optind];
                     if ((next[0] == '1' || next[0] == '2' ||
@@ -515,10 +542,10 @@ int main(int argc, const char * argv[])
                          next[0] == '5' || next[0] == '6') &&
                          next[1] == '\0') {
 
-                        verbose_level = atoi(next);
+                        g_verbose_level = atoi(next);
                         optind++;
                     } else {
-                        verbose_level = 1;
+                        g_verbose_level = kKXKextManagerLogLevelBasic;
                     }
                 }
             }
@@ -528,17 +555,12 @@ int main(int argc, const char * argv[])
             pretend_authentic = true;
             break;
 
-	case 'h':
-	  usage(2);
-	  exit_code = 0;
-	  goto finish;
+          case '?':
+            usage(0);
+            exit_code = 1;	// should be EX_USAGE (sysexits.h)
+            goto finish;
 
-	case '?':
-	  usage(0);
-	  exit_code = 1;	// should be EX_USAGE (sysexits.h)
-	  goto finish;
-
-        default:
+          default:
             fprintf(stderr, "unknown option -%c\n", optchar);
             usage(0);
             exit_code = 1;
@@ -546,12 +568,49 @@ int main(int argc, const char * argv[])
         }
     }
 
-   /* Try a lock on the volume for the mkext being updated.
+   /* If no kernel file was specified, use /mach_kernel. For prelinked kernel
+    * generation, its UUID must match that of the running kernel. This is always
+    * the case unless doing development and booting from a non-default kernel,
+    * or after the kernel has been replaced (in which case a prelinked kernel
+    * can still be generated by a developer if they specify the kernel file
+    * explicitly).
     */
-    if (mkextFilename) {
-        result = takeVolumeForPath(mkextFilename);
-        if (result) {
-            goto finish;
+    if (!kernel_file) {
+        kernel_file = default_kernel_file;
+        if (need_default_kernelcache_info && include_kernel_requests) {
+            mach_port_t host_port = MACH_PORT_NULL;
+            char * running_uuid = NULL;  // must free
+            unsigned int running_uuid_size;
+            const char * reason = NULL;
+
+           /* Clear these flags for now, they're set back to true if we can
+            * verify the UUID.
+            */
+            need_default_kernelcache_info = false;
+            include_kernel_requests = false;
+
+            host_port = mach_host_self(); /* must be privileged to work */
+            if (!MACH_PORT_VALID(host_port)) {
+                reason = "can't get host port to retrieve kernel symbols\n";
+            } else if (1 == copyKextUUID(host_port, NULL, NULL,
+                &running_uuid, &running_uuid_size)) {
+                if (1 == machoFileMatchesUUID(kernel_file,
+                    running_uuid, running_uuid_size)) {
+
+                    need_default_kernelcache_info = true;
+                    include_kernel_requests = true;
+                } else {
+                    reason = "/mach_kernel's UUID doesn't match running kernel\n";
+                }
+            }
+            if (!need_default_kernelcache_info) {
+                fprintf(stderr, "skipping prelinked kernel generation; %s\n",
+                    reason);
+            }
+            if (MACH_PORT_NULL != host_port) {
+                mach_port_deallocate(mach_task_self(), host_port);
+            }
+            if (running_uuid) free(running_uuid);
         }
     }
 
@@ -560,21 +619,18 @@ int main(int argc, const char * argv[])
     have_kernel_time     = (0 == stat(kernel_file,       &kernel_stat_buf));
     have_extensions_time = (0 == stat(source_extensions, &extensions_stat_buf));
 
-    if (have_kernel_time || have_extensions_time)
-    {
-	cacheFileTimes = _cacheFileTimes;
-	if (!have_kernel_time 
-	    || (have_extensions_time && (extensions_stat_buf.st_mtime > kernel_stat_buf.st_mtime)))
-	{
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
-	}
-	else
-	{
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &kernel_stat_buf.st_atimespec);
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &kernel_stat_buf.st_mtimespec);
-	}
-	cacheFileTimes[1].tv_sec++;
+    if (have_kernel_time || have_extensions_time) {
+        cacheFileTimes = _cacheFileTimes;
+        if (!have_kernel_time 
+            || (have_extensions_time && (extensions_stat_buf.st_mtime > kernel_stat_buf.st_mtime))) {
+            
+            TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
+            TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
+        } else {
+            TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &kernel_stat_buf.st_atimespec);
+            TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &kernel_stat_buf.st_mtimespec);
+        }
+        cacheFileTimes[1].tv_sec++;
     }
 
    /* If -c was given as the last argument, get the default kernelcache info
@@ -582,14 +638,40 @@ int main(int argc, const char * argv[])
     */
     if (need_default_kernelcache_info) {
         // default args for kextd's usage
+        int stat_result;
+        Boolean make_directory = false;
 
-        kernelCacheFilename = DEFAULT_CACHE_DIR "/kernelcache";
+        kernelCacheFilename = kPrelinkedKernelDir "/" kPrelinkedKernelBase;
         struct stat cache_stat_buf;
 
-        if ((-1 == stat(DEFAULT_CACHE_DIR, &cache_stat_buf))
-            || !(S_IFDIR & cache_stat_buf.st_mode)) {
-            mkdir(DEFAULT_CACHE_DIR, 0755);
+        stat_result = stat(kPrelinkedKernelDir, &cache_stat_buf);
+        if (0 == stat_result && !S_ISDIR(cache_stat_buf.st_mode)) {
+            kextd_error_log("%s exists as plain file; removing", kPrelinkedKernelDir);
+            if (-1 == unlink(kPrelinkedKernelDir)) {
+                kextd_error_log("failed to remove %s: %s", kPrelinkedKernelDir, strerror(errno));
+                exit_code = 1;
+                goto finish;
+            }
+            make_directory = true;
         }
+        if (-1 == stat_result) {
+            if (ENOENT == errno) {
+                make_directory = true;
+            } else {
+                kextd_error_log("error checking %s: %s",
+                    kPrelinkedKernelDir, strerror(errno));
+            }
+        }
+
+        if (make_directory) {
+            if (-1 == mkdir(kPrelinkedKernelDir, 0755)) {
+                kextd_error_log("error creating %s: %s",
+                    kPrelinkedKernelDir, strerror(errno));
+                exit_code = 1;
+                goto finish;
+            }
+        }
+
         // Make sure we scan the standard Extensions folder.
         CFArrayAppendValue(repositoryDirectories,
             kKXSystemExtensionsFolder);
@@ -626,7 +708,7 @@ int main(int argc, const char * argv[])
         }
 
         if (-1 == stat(SA_HAS_RUN_PATH, &cache_stat_buf)) {
-            if (verbose_level >= 1) {
+            if (g_verbose_level >= 1) {
                 verbose_log("SetupAssistant not yet run");
             }
             exit(0);
@@ -643,31 +725,17 @@ int main(int argc, const char * argv[])
     */
     if (!mkextFilename && !kernelCacheFilename && !repositoryCaches
 	    && !updateRoot) {
-        fprintf(stderr, "no work to do; one of -m, -c, -k, or -u must be specified\n");
+        fprintf(stderr, "no work to do; one of -m, -c, -k, or -u/-U must be specified\n");
         usage(1);
         exit_code = 1;
         goto finish;
     }
-
-    if (updateRoot) {
-	struct stat sb;
-
-	if (mkextFilename || kernelCacheFilename || repositoryCaches) {
-	    fprintf(stderr, "-u (auto-update) incompatible with other flags\n");
-	    usage(0);
-	    exit_code = 1;
-	    goto finish;
-	}
-
-	if (stat(updateRoot, &sb)) {
-	    warn("%s", updateRoot);
-	    exit_code = 1;
-	} else {
-	    exit_code = updateBoots(updateRoot, argc, argv, forceUpdate,
-				/*gross*/verbose_level);
-	}
-
-	goto finish;
+    
+    if (forceUpdate && (!updateRoot || expectUpToDate)) {
+        fprintf(stderr, "-f is only allowed with -u\n");
+        usage(1);
+        exit_code = 1;
+        goto finish;
     }
 
    /*****
@@ -675,7 +743,7 @@ int main(int argc, const char * argv[])
     */
     for (i = 0; i < argc; i++) {
         CFStringRef argString = CFStringCreateWithCString(kCFAllocatorDefault,
-              argv[i], kCFStringEncodingMacRoman);
+              argv[i], kCFStringEncodingUTF8);
         if (!argString) {
             fprintf(stderr, "memory allocation failure\n");
             exit_code = 1;
@@ -715,7 +783,7 @@ int main(int argc, const char * argv[])
         CFRelease(argString);
     }
 
-    if (CFArrayGetCount(kextNames) == 0 &&
+    if (!updateRoot && CFArrayGetCount(kextNames) == 0 &&
         CFArrayGetCount(repositoryDirectories) == 0) {
 
         fprintf(stderr, "no kernel extensions or directories specified\n\n");
@@ -725,51 +793,71 @@ int main(int argc, const char * argv[])
     }
 
     if (forkExit) {
-        if (verbose_level >= 1) {
-            verbose_log("forking a child process to do the work\n");
+        if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
+            verbose_log("running in low-priority background mode");
         }
 
-        switch (fork()) {
-          case -1:
-            fprintf(stderr, "cannot fork\n");
+        setpriority(PRIO_PROCESS, getpid(), 20); // run at really low priority
+        if (include_kernel_requests) {
+            kern_return_t    kern_result;
+            mach_timespec_t  waitTime = { 40, 0 };
+            
+            kern_result = IOKitWaitQuiet(kIOMasterPortDefault, &waitTime);
+            if (kern_result == kIOReturnTimeout) {
+                fprintf(stderr, "IOKitWaitQuiet() timed out");
+            } else if (kern_result != kIOReturnSuccess) {
+                fprintf(stderr, "IOKitWaitQuiet() failed with result code %x",
+                        kern_result);
+            }
+        }
+    }
+
+    if (updateRoot) {
+        struct stat sb;
+        
+        if (mkextFilename || kernelCacheFilename || repositoryCaches) {
+            fprintf(stderr, "-u/-U (auto-update) incompatible with other flags\n");
+            usage(0);
             exit_code = 1;
             goto finish;
-            break;
-          case 0:   // child task
-            setpriority(PRIO_PROCESS, getpid(), 20); // run at really low priority
-	    if (include_kernel_requests) {
-		kern_return_t    kern_result;
-		mach_timespec_t  waitTime = { 40, 0 };
-
-		kern_result = IOKitWaitQuiet(kIOMasterPortDefault, &waitTime);
-		if (kern_result == kIOReturnTimeout) {
-		    fprintf(stderr, "IOKitWaitQuiet() timed out");
-		} else if (kern_result != kIOReturnSuccess) {
-		    fprintf(stderr, "IOKitWaitQuiet() failed with result code %x",
-				    kern_result);
-		}
-		sleep(40);
-	    }
-            break;
-          default:  // parent task
-            exit_code = 0;
+        }
+        
+        if (stat(updateRoot, &sb)) {
+            warn("%s", updateRoot);
+            exit_code = 1;
+        } else {
+            exit_code=updateBoots(updateRoot,argc,argv,forceUpdate,expectUpToDate);
+        }
+        
+        goto finish;
+    }
+    
+   /* Try a lock on the volume for the mkext being updated.
+    */
+    if (mkextFilename && !getenv("_com_apple_kextd_skiplocks")) {
+	result = takeVolumeForPath(mkextFilename);
+        if (result) {
             goto finish;
-            break;
         }
     }
 
     if (include_kernel_requests)
-	get_catalog_demand_lists(&kernel_requests, &kernel_cache_misses, verbose_level);
+	get_catalog_demand_lists(&kernel_requests, &kernel_cache_misses);
 
     if (cache_looks_uptodate)
     {
-	CFShow(kernel_cache_misses);
-	CFShow(kernel_requests);
+       /* Only log these particular bits if it's likely an interactive run. We don't want
+        * this spew in the system logs.
+        */
+        if (!forkExit) {
+            CFShow(kernel_cache_misses);
+            CFShow(kernel_requests);
+        }
 	if ((!kernel_cache_misses || !kernel_requests)
 	    || (!CFSetGetCount(kernel_cache_misses))
 	    || (CFSetGetCount(kernel_cache_misses) == CFSetGetCount(kernel_requests)))
 	{
-	    if (verbose_level >= 1) {
+	    if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
 		verbose_log("cache %s up to date", kernelCacheFilename);
 	    }
 	    exit(0);
@@ -798,7 +886,7 @@ int main(int argc, const char * argv[])
 
     KXKextManagerSetPerformsFullTests(theKextManager, do_tests);
     KXKextManagerSetPerformsStrictAuthentication(theKextManager, true);
-    KXKextManagerSetLogLevel(theKextManager, verbose_level);
+    KXKextManagerSetLogLevel(theKextManager, g_verbose_level);
     KXKextManagerSetLogFunction(theKextManager, &verbose_log);
     KXKextManagerSetErrorLogFunction(theKextManager, &error_log);
     KXKextManagerSetUserVetoFunction(theKextManager, &user_approve);
@@ -830,7 +918,7 @@ int main(int argc, const char * argv[])
         if (!directoryURL) {
             char repositoryPath[MAXPATHLEN];
             if (!CFStringGetCString(directory, repositoryPath,
-                sizeof(repositoryPath) / sizeof(char), kCFStringEncodingMacRoman)) {
+                sizeof(repositoryPath) / sizeof(char), kCFStringEncodingUTF8)) {
 
                 fprintf(stderr, "string conversion error\n");
 
@@ -877,7 +965,7 @@ int main(int argc, const char * argv[])
     * Add each kext named on the command line to the manager and collect
     * their names in the kextNamesToUse array.
     */
-    if (!addKextsToManager(theKextManager, kextNames, kextNamesToUse, do_tests)) {
+    if (addKextsToManager(theKextManager,kextNames,kextNamesToUse,do_tests)<1){
         exit_code = 1;
         goto finish;
     }
@@ -902,9 +990,13 @@ int main(int argc, const char * argv[])
         for (i = 0; i < count; i++) {
             KXKextRepositoryRef repository = (KXKextRepositoryRef)
                 CFArrayGetValueAtIndex(repositories, i);
-            /*KXKextManagerError kmResult = */ KXKextRepositoryWriteCache(
+            KXKextManagerError kmResult =  KXKextRepositoryWriteCache(
                 repository, NULL);
-            // FIXME: Do anything with kmResult?
+            if (kmResult != kKXKextManagerErrorNone) {
+                // write function prints error message
+                exit_code = 1;
+                goto finish;
+            }
         }
     }
 
@@ -982,14 +1074,14 @@ int main(int argc, const char * argv[])
                                   hostArch->cputype, hostArch->cpusubtype,
                                   local_for_all, network_for_all, safeboot_for_all,
 				  kernel_requests,
-                                  verbose_level, do_tests);
+                                  g_verbose_level, do_tests);
         collectKextsForMkextCache(repositoryKexts, checkDictionary,
                                   hostArch->cputype, hostArch->cpusubtype,
                                   local_for_repositories || local_for_all,
                                   network_for_repositories || network_for_all,
                                   safeboot_for_repositories || safeboot_for_all,
 				  kernel_requests,
-                                  verbose_level, do_tests);
+                                  g_verbose_level, do_tests);
 
 	all_plists = false;
 	if (!include_kernel_requests) {
@@ -1003,7 +1095,7 @@ int main(int argc, const char * argv[])
 			platform_name_root_path.platform_name, platform_name_root_path.root_path,
 			kernel_requests, all_plists,
 			hostArch, // archs[0],
-			verbose_level, debug_mode);
+			g_verbose_level, debug_mode);
 
 	if (kKXKextManagerErrorNone != err)
 	{
@@ -1018,29 +1110,46 @@ domkext:
         goto finish;
     }
 
-    temp_dir = getenv("TMPDIR");
-    if (!temp_dir)
-        temp_dir = "/tmp";
-    temp_file = malloc(strlen(temp_dir) + strlen(TEMP_DIR) + 1);
-    strcpy(temp_file, temp_dir);
-    strcat(temp_file, TEMP_DIR);
-    mktemp(temp_file);
+    if (strlcpy(temp_file, mkextFilename, sizeof(temp_file)) >= sizeof(temp_file)) {
+        fprintf(stderr, "cache file name too long: %s",
+            mkextFilename);
+        exit_code = 1;
+        goto finish;
+    }
+    if (strlcat(temp_file, ".XXXX", sizeof(temp_file)) >= sizeof(temp_file)) {
+        fprintf(stderr, "cache file name too long: %s",
+            mkextFilename);
+        exit_code = 1;
+        goto finish;
+    }
 
-    fd = open(temp_file, O_WRONLY|O_CREAT|O_TRUNC, 0666);
+    fd = mkstemp(temp_file);
     if (-1 == fd) {
         fprintf(stderr, "can't create %s - %s\n", temp_file,
             strerror(errno));
-        result = false;
+        exit_code = 1;
         goto finish;  // FIXME: mkextcache used to exit with EX_CANTCREAT
     }
+
     output_filename = temp_file;
+
+   /* Set the umask to get it, then set it back to iself. Wish there were a
+    * better way to query it.
+    */
+    real_umask = umask(0);
+    umask(real_umask);
+
+    if (-1 == fchmod(fd, MKEXT_PERMS & ~real_umask)) {
+        fprintf(stderr, "%s - %s\n",
+            temp_file, strerror(errno));
+    }
 
     struct fat_header fatHeader;
     struct fat_arch fatArchs[kMaxArchs];
     unsigned long fat_offset = 0;
     ssize_t bytes_written = 0;
 
-    if (nArchs > 1) {
+    if (nArchs > 1 || explicit_arch) {
         fat_offset = sizeof(struct fat_header) + (sizeof(struct fat_arch) * nArchs);
         lseek(fd, fat_offset, SEEK_SET);
     }
@@ -1050,25 +1159,26 @@ domkext:
         fatArchs[i].cpusubtype = NXSwapHostLongToBig(archs[i]->cpusubtype);
         fatArchs[i].offset = NXSwapHostLongToBig(fat_offset);
 
-        if (verbose_level >= 1) {
+        if (g_verbose_level >= kKXKextManagerLogLevelBasic) {
             verbose_log("processing architecture %s", archs[i]->name);
         }
         CFDictionaryRemoveAllValues(checkDictionary);
         collectKextsForMkextCache(namedKexts, checkDictionary,
-                                  archs[i]->cputype, archs[i]->cpusubtype,
-                                  local_for_all, network_for_all, safeboot_for_all,
-				  NULL /*kernel_requests*/,
-                                  verbose_level, do_tests);
+            archs[i]->cputype, archs[i]->cpusubtype,
+            local_for_all, network_for_all, safeboot_for_all,
+            NULL /*kernel_requests*/,
+            g_verbose_level, do_tests);
         collectKextsForMkextCache(repositoryKexts, checkDictionary,
-                                  archs[i]->cputype, archs[i]->cpusubtype,
-                                  local_for_repositories || local_for_all,
-                                  network_for_repositories || network_for_all,
-                                  safeboot_for_repositories || safeboot_for_all,
-				  NULL /*kernel_requests*/,
-                                  verbose_level, do_tests);
+            archs[i]->cputype, archs[i]->cpusubtype,
+            local_for_repositories || local_for_all,
+            network_for_repositories || network_for_all,
+            safeboot_for_repositories || safeboot_for_all,
+            NULL /*kernel_requests*/,
+            g_verbose_level, do_tests);
 
         bytes_written = createMkextArchive(fd, checkDictionary, output_filename,
-                                archs[i]->name, archs[i]->cputype, archs[i]->cpusubtype, verbose_level);
+            archs[i]->name, archs[i]->cputype,
+            archs[i]->cpusubtype, g_verbose_level);
 
         if (bytes_written < 0) {
             exit_code = 1;
@@ -1076,17 +1186,17 @@ domkext:
         }
         fat_offset += bytes_written;
 
-        if (checkMkextArchiveSize(bytes_written) == false) {
-                fprintf(stderr, "archive would be too large; aborting\n");
-                exit_code = 1;
-                goto finish;
+        if (mkextArchiveSizeOverLimit(bytes_written, archs[i]->cputype)) {
+            fprintf(stderr, "archive would be too large; aborting\n");
+            exit_code = 1;
+            goto finish;
         }
 
         fatArchs[i].size = NXSwapHostLongToBig(bytes_written);
         fatArchs[i].align = NXSwapHostLongToBig(0);
     }
 
-    if (nArchs > 1) {
+    if (nArchs > 1 || explicit_arch) {
         lseek(fd, 0, SEEK_SET);
         fatHeader.magic = NXSwapHostLongToBig(FAT_MAGIC);
         fatHeader.nfat_arch = NXSwapHostLongToBig(nArchs);
@@ -1110,38 +1220,36 @@ domkext:
     close(fd);
     fd = -1;
 
-    if (have_extensions_time)
-    {
-	struct timespec mod_time = extensions_stat_buf.st_mtimespec;
-	if ((0 == stat(source_extensions, &extensions_stat_buf))
-	  && ((mod_time.tv_sec != extensions_stat_buf.st_mtimespec.tv_sec)
-	      || (mod_time.tv_nsec != extensions_stat_buf.st_mtimespec.tv_nsec)))
-	{
-	    fprintf(stderr, "cache stale - not creating %s\n", mkextFilename);
-	    exit_code = 1;
-	    goto finish;
-	}
+    if (have_extensions_time) {
+        struct timespec mod_time = extensions_stat_buf.st_mtimespec;
+        if ((0 == stat(source_extensions, &extensions_stat_buf))
+          && ((mod_time.tv_sec != extensions_stat_buf.st_mtimespec.tv_sec)
+              || (mod_time.tv_nsec != extensions_stat_buf.st_mtimespec.tv_nsec)))
+        {
+            fprintf(stderr, "cache stale - not creating %s\n", mkextFilename);
+            exit_code = 1;
+            goto finish;
+        }
 
-	TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
-	TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
-	cacheFileTimes[1].tv_sec++;
+        TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
+        TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
+        cacheFileTimes[1].tv_sec++;
     }
 
     // move it to the final destination
     if (-1 == rename(output_filename, mkextFilename)) {
-	fprintf(stderr, "can't create file %s: %s\n", mkextFilename,
-		strerror(errno));
-	exit_code = 1;
-	goto finish;
+        fprintf(stderr, "%s - %s\n", mkextFilename, strerror(errno));
+        exit_code = 1;
+        goto finish;
     }
     output_filename = NULL;
 
     // give the cache file the mod time of the source files when kextcache started
     if (cacheFileTimes && (-1 == utimes(mkextFilename, cacheFileTimes))) {
-	fprintf(stderr, "can't set file times %s: %s\n", mkextFilename,
-		strerror(errno));
-	exit_code = 1;
-	goto finish;
+        fprintf(stderr, "%s - %s\n", mkextFilename,
+            strerror(errno));
+        exit_code = 1;
+        goto finish;
     }
 
 finish:
@@ -1151,14 +1259,12 @@ finish:
     */
 
     if (-1 != fd) close(fd);
-    if (output_filename)
-    {
-	if (-1 == unlink(output_filename)) {
-	    fprintf(stderr, "can't remove file %s - %s\n", output_filename,
-			strerror(errno));
-	}
+    if (output_filename) {
+        if (-1 == unlink(output_filename)) {
+            fprintf(stderr, "%s - %s\n", output_filename,
+                strerror(errno));
+        }
     }
-    if (temp_file)             free(temp_file);
     if (repositoryDirectories) CFRelease(repositoryDirectories);
     if (kextNames)             CFRelease(kextNames);
     if (kextNamesToUse)        CFRelease(kextNamesToUse);
@@ -1174,20 +1280,28 @@ finish:
 }
 
 /*******************************************************************************
-* takeVolume takes a dev_t to lock with kextd
+* takeVolumeForPath turns the path into a volume UUID and locks with kextd
 *******************************************************************************/
-// upstat() stat()s up the parental chain if a file doesn't exist
-static int upstat(const char *path, struct stat *sb)
+// upstat() stat()s "up" the path if a file doesn't exist
+static int upstat(const char *path, struct stat *sb, struct statfs *sfs)
 {
-    int rval;
-    const char *tpath = path;
+    int rval = ELAST+1;
+    char buf[PATH_MAX], *tpath = buf;
+    struct stat defaultsb;
 
-    while ((rval = stat(tpath, sb)) != 0 && errno == ENOENT) {
+    if (strlcpy(buf, path, PATH_MAX) > PATH_MAX)  	goto finish;
+
+    if (!sb)	sb = &defaultsb;
+    while ((rval = stat(tpath, sb)) == -1 && errno == ENOENT) {
 	// "." and "/" should always exist, but you never know
 	if (tpath[0] == '.' && tpath[1] == '\0')  goto finish;
 	if (tpath[0] == '/' && tpath[1] == '\0')  goto finish;
-	tpath = dirname(tpath);	    // our dirname() takes a const char*
+	tpath = dirname(tpath);	    // Tiger's dirname() took const char*
     }
+
+    // call statfs if the caller needed it
+    if (sfs)
+	rval = statfs(tpath, sfs);
 
 finish:
     if (rval)
@@ -1196,24 +1310,41 @@ finish:
     return rval;
 }
 
-// takeVolumeForPath used by forms other than '-u' (e.g. mkext)
-static int takeVolumeForPath(const char *path)
+#define COMPILE_TIME_ASSERT(pred)   switch(0){case 0:case pred:;}
+static int getVolumeUUID(const char *volPath, uuid_t vol_uuid)
 {
     int rval = ELAST + 1;
-    struct stat sb;
+    DADiskRef dadisk = NULL;
+    CFDictionaryRef dadesc = NULL;
+    CFUUIDRef volUUID;      // just a reference into the dict
+    CFUUIDBytes uuidBytes;
+COMPILE_TIME_ASSERT(sizeof(CFUUIDBytes) == sizeof(uuid_t));
 
-    rval = upstat(path, &sb);
-    if (rval)  goto finish;
-    rval = takeVolume(sb.st_dev);
+    dadisk = createDiskForMount(NULL, volPath);
+    if (!dadisk)        goto finish;
+    dadesc = DADiskCopyDescription(dadisk);
+    if (!dadesc)        goto finish;
+    volUUID = CFDictionaryGetValue(dadesc, kDADiskDescriptionVolumeUUIDKey);
+    if (!volUUID)       goto finish;
+    uuidBytes = CFUUIDGetUUIDBytes(volUUID);
+    memcpy(vol_uuid, &uuidBytes.byte0, sizeof(uuid_t));   // sizeof(vol_uuid)?
+
+    rval = 0;
 
 finish:
+    if (dadesc)     CFRelease(dadesc);
+    if (dadisk)     CFRelease(dadisk);
+
+    if (rval)
+	warnx("%s: couldn't get volume UUID");
     return rval;
 }
+
 
 // takeVolumeForPaths ensures all paths are on the given volume, then locks
 int takeVolumeForPaths(char *volPath, int filec, const char *files[])
 {
-    int rval, bsderr, i;
+    int i, bsderr, rval = ELAST + 1;
     struct stat volsb;
 
     bsderr = stat(volPath, &volsb);
@@ -1222,17 +1353,19 @@ int takeVolumeForPaths(char *volPath, int filec, const char *files[])
     for (i = 0; i < filec; i++) {
 	struct stat sb;
 
-	rval = upstat(files[i], &sb);
-	if (rval)  goto finish;
+	if ((bsderr = upstat(files[i], &sb, NULL)))
+	    goto finish;
 
 	// better be on the same device as the volume
 	if (sb.st_dev != volsb.st_dev) {
 	    warnx("can't lock: %s, %s on different volumes", volPath, files[i]);
+	    errno = EPERM;
+	    bsderr = -1;
 	    goto finish;
 	}
     }
 
-    rval = takeVolume(volsb.st_dev);
+    rval = takeVolumeForPath(volPath);
 
 finish:
     if (bsderr) {
@@ -1245,16 +1378,19 @@ finish:
 
 // can return success if a lock isn't needed
 // can return failure if sLockPort is already in use
-static int takeVolume(dev_t devid)
+#define WAITFORLOCK 1
+static int takeVolumeForPath(const char *path)
 {
     int rval = ELAST + 1;
-    int lckstatus, nretries = LCK_MAXTRIES;
-    Boolean createdPort = false;
-    dev_path_t voldev = "<unknown>";
     kern_return_t macherr = KERN_SUCCESS;
-    mach_port_t tport = MACH_PORT_NULL;
+    int lckres = 0;
+    struct statfs sfs;
+    const char *volPath;
+    mach_port_t taskport = MACH_PORT_NULL;
 
-    if (sLockPort)  goto finish;    // only support one lock at a time :)
+    if (sLockPort) {
+        return EALREADY;        // only support one lock at a time
+    }
 
     if (getuid() != 0) {
 	// kextd shouldn't be watching anything you can touch
@@ -1263,61 +1399,75 @@ static int takeVolume(dev_t devid)
 	goto finish;
     }
 
-    tport = mach_task_self();
-    if (tport == MACH_PORT_NULL)  goto finish;
-
-    // look up kextd if not cached
+    // look up kextd port if not cached
+    // XX if there's a way to know kextd isn't running, we could skip
+    // unnecessarily bringing it up in the boot-time case (5108882?).
     if (!sKextdPort) {
-	mach_port_t bsport;
-	macherr = task_get_bootstrap_port(tport, &bsport);
-	if (macherr)  goto finish;
-	macherr = bootstrap_look_up(bsport, KEXTD_SERVER_NAME, &sKextdPort);
-	if (macherr)  goto finish;
+        macherr=bootstrap_look_up(bootstrap_port,KEXTD_SERVER_NAME,&sKextdPort);
+        if (macherr)  goto finish;
     }
 
-    // convert dev_t into diskXsY
-    if(!devname_r(devid, S_IFBLK, voldev, DEVMAXPATHSIZE))  goto finish;
+    if ((rval = upstat(path, NULL, &sfs)))	goto finish;
+    volPath = sfs.f_mntonname;
 
-    // allocate a port to pass (in case we die -- it's released on exit() :)
-    macherr = mach_port_allocate(tport,MACH_PORT_RIGHT_RECEIVE,&sLockPort);
-    createdPort = true;
+    // get the volume's UUID
+    if (getVolumeUUID(volPath, s_vol_uuid)) {
+	goto finish;
+    }
+    
+    // allocate a port to pass (in case we die -- kernel cleans up on exit())
+    taskport = mach_task_self();
+    if (taskport == MACH_PORT_NULL)  goto finish;
+    macherr = mach_port_allocate(taskport, MACH_PORT_RIGHT_RECEIVE, &sLockPort);
     if (macherr)  goto finish;
-    // take the lock in a retry/delay loop in case the volume is busy
-    do {
-	macherr = kextmanager_lock_volume(sKextdPort, sLockPort, voldev,&lckstatus);
-	if (macherr)  goto finish;
 
-	if (lckstatus == EBUSY) {
-	    warnx("%s locked; sleeping (%d retries left)", voldev, --nretries);
-	    sleep(LCK_DELAY);
-	}
-    } while (lckstatus == EBUSY && nretries > 0);
+    // try to take the lock; warn if it's busy and then wait for it
+    // X kextcache -U, if it is going to lock at all, needs only WAITFORLOCK
+    macherr = kextmanager_lock_volume(sKextdPort, sLockPort, s_vol_uuid,
+	    			      !WAITFORLOCK, &lckres);
+    if (macherr) 	goto finish;
+    if (lckres == EBUSY) {
+	warnx("%s locked; waiting for lock", volPath);
+	macherr = kextmanager_lock_volume(sKextdPort, sLockPort, s_vol_uuid,
+					  WAITFORLOCK, &lckres);
+	if (macherr) 	goto finish;
+	if (lckres == 0)
+	    warnx("proceeding");
+    }
+    
+    // kextd might not be watching this volume 
+    // or might be telling us that it went away (not watching any more)
+    // so we set our success to the existance of the volume's root
+    if (lckres == ENOENT) {
+	struct stat sb;
+	rval = stat(volPath, &sb);
+    } else {
+	rval = lckres;
+    }
 
-    rval = lckstatus;
+finish:	
+    if (sLockPort != MACH_PORT_NULL && (lckres != 0 || macherr)) {
+	mach_port_mod_refs(taskport, sLockPort, MACH_PORT_RIGHT_RECEIVE, -1);
+	sLockPort = MACH_PORT_NULL;
+    }
 
-
-finish:
+    /* XX needs unraveling XX */
     // if kextd isn't competing with us, then we didn't need the lock
-    if (lckstatus == ENOENT || macherr == BOOTSTRAP_UNKNOWN_SERVICE) {
-	mach_port_mod_refs(tport, sLockPort, MACH_PORT_RIGHT_RECEIVE, -1);
-	sLockPort = nil;
+    if (macherr == BOOTSTRAP_UNKNOWN_SERVICE) {
 	rval = 0;
-    } else if (macherr != KERN_SUCCESS) {
-	if (macherr <= KERN_RETURN_MAX) {
-	    warnx("couldn't lock %s: %s",voldev,mach_error_string(macherr));
-	} else {
-	    warnx("couldn't lock %s: error %d", voldev, macherr);
-	}
+    } else if (macherr) {
+	warnx("couldn't lock %s: %s (%d)", path,
+	    mach_error_string(macherr), macherr);
 	rval = macherr;
     } else {
-	if (rval) {
-	    warnx("couldn't lock %s: %s", voldev, strerror(rval));
+	// dump rval
+	if (rval == -1) {
+	    warn("couldn't lock %s", path);
+	    rval = errno;
+	} else if (rval) {
+	    // lckres == EAGAIN should get here
+	    warnx("couldn't lock %s: %s", path, strerror(rval));
 	}
-    }
-
-    if (rval && createdPort) {
-	mach_port_mod_refs(tport, sLockPort, MACH_PORT_RIGHT_RECEIVE, -1);
-	sLockPort = nil;
     }
 
     return rval;
@@ -1326,41 +1476,26 @@ finish:
 
 /*******************************************************************************
 * putVolumeForPath will unlock the relevant volume, passing 'status' to
-* inform kextd whether of our potential success
+* inform kextd whether we succeded, failed, or just need more time
 *******************************************************************************/
 int putVolumeForPath(const char *path, int status)
 {
     int rval = KERN_SUCCESS;
-    struct stat sb;
-    dev_path_t voldev;
 
     // if not locked, don't sweat it
-    if (!sLockPort) {
-	rval = 0;
+    if (sLockPort == MACH_PORT_NULL)
 	goto finish;
-    }
 
-    rval = upstat(path, &sb);
-    if (rval)  goto finish;
-    // get "diskXsY"
-    if(!devname_r(sb.st_dev, S_IFBLK, voldev, DEVMAXPATHSIZE))  goto finish;
+    rval = kextmanager_unlock_volume(sKextdPort, sLockPort, s_vol_uuid, status);
 
-    rval = kextmanager_unlock_volume(sKextdPort, sLockPort, voldev, status);
-
-    // the server will clean us up (with an error logged) if we couldn't
-    mach_port_mod_refs(mach_task_self(), sLockPort, MACH_PORT_RIGHT_RECEIVE,-1);
-    sLockPort = nil;
+    // tidy up; the server will clean up its stuff if we die prematurely
+    mach_port_mod_refs(mach_task_self(),sLockPort,MACH_PORT_RIGHT_RECEIVE,-1);
+    sLockPort = MACH_PORT_NULL;
 
 finish:
     if (rval) {
-	if (rval == -1) {
-	    warn("trouble unlocking volume for %s", path);
-	} else if (rval <= KERN_RETURN_MAX) {
-	    warnx("couldn't unlock volume for %s: %s",
-		path, mach_error_string(rval));
-	} else {
-	    warnx("couldn't unlock volume for %s: error %d", path, rval);
-	}
+	warnx("couldn't unlock volume for %s: %s (%d)",
+	    path, mach_error_string(rval), rval);
     }
 
     return rval;
@@ -1371,12 +1506,11 @@ finish:
 *******************************************************************************/
 
 static void get_catalog_demand_lists(CFMutableSetRef * kernel_requests,
-				      CFSetRef * kernel_cache_misses,
-				      int verbose_level)
+				      CFSetRef * kernel_cache_misses)
 {
     kern_return_t kr;
-    char * propertiesBuffer;
-    int    loaded_bytecount;
+    char *   propertiesBuffer;
+    uint32_t loaded_bytecount;
 
     kr = IOCatalogueGetData(MACH_PORT_NULL, kIOCatalogGetModuleDemandList,
 			    &propertiesBuffer, &loaded_bytecount);
@@ -1394,7 +1528,7 @@ static void get_catalog_demand_lists(CFMutableSetRef * kernel_requests,
 			    &propertiesBuffer, &loaded_bytecount);
     if (kIOReturnSuccess == kr)
     { 
-	if (verbose_level > 0)
+	if (g_verbose_level > kKXKextManagerLogLevelDefault)
 	    verbose_log("cache misses:\n%s", propertiesBuffer);
 	*kernel_cache_misses = (CFSetRef)
 		IOCFUnserialize(propertiesBuffer, kCFAllocatorDefault, 0, 0);
@@ -1405,52 +1539,7 @@ static void get_catalog_demand_lists(CFMutableSetRef * kernel_requests,
 /*******************************************************************************
 *
 *******************************************************************************/
-char * CFURLCopyCString(CFURLRef anURL)
-{
-    char * string = NULL; // returned
-    CFIndex bufferLength;
-    CFURLRef absURL = NULL;        // must release
-    CFStringRef urlString = NULL;  // must release
-    Boolean error = false;
-
-    absURL = CFURLCopyAbsoluteURL(anURL);
-    if (!absURL) {
-        goto finish;
-    }
-
-    urlString = CFURLCopyFileSystemPath(absURL, kCFURLPOSIXPathStyle);
-    if (!urlString) {
-        goto finish;
-    }
-
-    bufferLength = 1 + CFStringGetLength(urlString);
-
-    string = (char *)malloc(bufferLength * sizeof(char));
-    if (!string) {
-        goto finish;
-    }
-
-    if (!CFStringGetCString(urlString, string, bufferLength,
-           kCFStringEncodingMacRoman)) {
-
-        error = true;
-        goto finish;
-    }
-
-finish:
-    if (error) {
-        free(string);
-        string = NULL;
-    }
-    if (absURL)    CFRelease(absURL);
-    if (urlString) CFRelease(urlString);
-    return string;
-}
-
-
-/*******************************************************************************
-*
-*******************************************************************************/
+// XX can stop passing verbose_level to these functions
 static void addKextForMkextCache(
     KXKextRef theKext,
     CFMutableDictionaryRef checkDictionary,
@@ -1473,7 +1562,7 @@ static void addKextForMkextCache(
     CFStringRef requiredString = NULL;    // don't release
 
     CFURLRef executableURL = NULL;        // must release
-    char * executable_path = NULL;  // must free
+    char executable_path[PATH_MAX];
 
     int fd = -1;         // sentinel value for close() call at finish
     caddr_t machO = (caddr_t)-1; // sentinel value for munmap() call at finish
@@ -1486,7 +1575,7 @@ static void addKextForMkextCache(
     }
 
     if (!CFStringGetCString(kextName, kext_name,
-        sizeof(kext_name) / sizeof(char), kCFStringEncodingMacRoman)) {
+        sizeof(kext_name) / sizeof(char), kCFStringEncodingUTF8)) {
 
         fprintf(stderr, "string conversion failure\n");
         include_it = false;
@@ -1534,9 +1623,9 @@ static void addKextForMkextCache(
     
         if (!requiredString) {
 
-            if (verbose_level >= 3) {
+            if (verbose_level >= kKXKextManagerLogLevelDetails) {
                 verbose_log("skipping bundle %s; no OSBundleRequired key "
-                    "(still checking plugins)\n",
+                    "(still checking plugins)",
                     kext_name);
             }
             include_it = false;
@@ -1584,10 +1673,10 @@ static void addKextForMkextCache(
                strcpy(required_string, "(unknown)");
             }
 
-            if (verbose_level >= 3) {
+            if (verbose_level >= kKXKextManagerLogLevelDetails) {
                 verbose_log(
                     "skipping bundle %s; OSBundleRequired key is \"%s\" "
-                    "(still checking plugins)\n",
+                    "(still checking plugins)",
                     kext_name, required_string);
             }
             include_it = false;
@@ -1639,8 +1728,8 @@ static void addKextForMkextCache(
             goto finish;
         } else {
 
-            executable_path = CFURLCopyCString(executableURL);
-            if (!executable_path) {
+            if (!CFURLGetFileSystemRepresentation(executableURL,true/*resolve*/,
+		    (UInt8*)executable_path, PATH_MAX)) {
                 fprintf(stderr, "memory allocation failure\n");
                 exit(1);
             } else {
@@ -1682,10 +1771,12 @@ static void addKextForMkextCache(
                 find_arch(NULL, &archSize, archCPU, archSubtype,
                    (u_int8_t *)machO, machOSize);
                 if (!archSize) { // Couldn't find an architecture
-                    fprintf(stderr, "%s doesn't contain code for the "
-                        "architecture specified; "
-                        "skipping the kext that contains it\n",
-                        executable_path);
+                    if (verbose_level >= kKXKextManagerLogLevelDetails) {
+                        fprintf(stderr, "%s doesn't contain code for the "
+                            "architecture specified; "
+                            "skipping the kext that contains it\n",
+                            executable_path);
+                    }
                     include_it = false;
                     do_children = true;
                     goto finish;
@@ -1716,7 +1807,6 @@ finish:
 
     if (kextName)        CFRelease(kextName);
     if (executableURL)   CFRelease(executableURL);
-    if (executable_path) free(executable_path);
 
     return;
 }
@@ -1759,289 +1849,6 @@ finish:
 }
 
 /*******************************************************************************
-* verbose_log()
-*
-* Print a log message prefixed with the name of the program.
-*******************************************************************************/
-
-__private_extern__ void verbose_log(const char * format, ...)
-{
-    va_list ap;
-    char fake_buffer[2];
-    int output_length;
-    char * output_string;
-
-    va_start(ap, format);
-    output_length = vsnprintf(fake_buffer, 1, format, ap);
-    va_end(ap);
-
-    output_string = (char *)malloc(output_length + 1);
-    if (!output_string) {
-        fprintf(stderr, "memory allocation failure\n");
-        return;
-    }
-
-    va_start(ap, format);
-    vsprintf(output_string, format, ap);
-    va_end(ap);
-
-    va_start(ap, format);
-    fprintf(stdout, "%s: %s\n", progname, output_string);
-    va_end(ap);
-
-    free(output_string);
-
-    return;
-}
-
-/*******************************************************************************
-* error_log()
-*
-* Print an error message prefixed with the name of the program.
-*******************************************************************************/
-static void error_log(const char * format, ...)
-{
-    va_list ap;
-    char fake_buffer[2];
-    int output_length;
-    char * output_string;
-
-    va_start(ap, format);
-    output_length = vsnprintf(fake_buffer, 1, format, ap);
-    va_end(ap);
-
-    output_string = (char *)malloc(output_length + 1);
-    if (!output_string) {
-        fprintf(stderr, "memory allocation failure\n");
-        return;
-    }
-
-    va_start(ap, format);
-    vsprintf(output_string, format, ap);
-    va_end(ap);
-
-    va_start(ap, format);
-    fprintf(stderr, "%s: %s\n", progname, output_string);
-    va_end(ap);
-
-    free(output_string);
-
-    return;
-}
-
-/*******************************************************************************
-* user_approve()
-*
-* Ask the user a question and wait for a yes/no answer.
-*******************************************************************************/
-static int user_approve(int default_answer, const char * format, ...)
-{
-    int result = 1;
-    va_list ap;
-    char fake_buffer[2];
-    int output_length;
-    char * output_string;
-    char * prompt_string = NULL;
-    int c, x;
-
-    va_start(ap, format);
-    output_length = vsnprintf(fake_buffer, 1, format, ap);
-    va_end(ap);
-
-    output_string = (char *)malloc(output_length + 1);
-    if (!output_string) {
-        fprintf(stderr, "memory allocation failure\n");
-        result = -1;
-        goto finish;
-    }
-
-    va_start(ap, format);
-    vsprintf(output_string, format, ap);
-    va_end(ap);
-
-    prompt_string = default_answer ? " [Y/n]" : " [y/N]";
-    
-    while ( 1 ) {
-        fprintf(stdout, "%s%s%s", output_string, prompt_string, "? ");
-        fflush(stdout);
-
-        c = fgetc(stdin);
-
-        if (c == EOF) {
-            result = -1;
-            goto finish;
-        }
-
-       /* Make sure we get a newline.
-        */
-        if ( c != '\n' ) {
-            do {
-                x = fgetc(stdin);
-            } while (x != '\n' && x != EOF);
-
-            if (x == EOF) {
-                result = -1;
-                goto finish;
-            }
-        }
-
-        if (c == '\n') {
-            result = default_answer ? 1 : 0;
-            goto finish;
-        } else if (tolower(c) == 'y') {
-            result = 1;
-            goto finish;
-        } else if (tolower(c) == 'n') {
-            result = 0;
-            goto finish;
-        }
-    }
-
-
-finish:
-    if (output_string) free(output_string);
-
-    return result;
-}
-
-/*******************************************************************************
-* user_input()
-*
-* Ask the user for input.
-*******************************************************************************/
-static const char * user_input(const char * format, ...)
-{
-    char * result = NULL;  // return value
-    va_list ap;
-    char fake_buffer[2];
-    int output_length;
-    char * output_string = NULL;
-    unsigned index;
-    size_t size = 80;
-    int c;
-
-    result = (char *)malloc(size);
-    if (!result) {
-        goto finish;
-    }
-    index = 0;
-
-    va_start(ap, format);
-    output_length = vsnprintf(fake_buffer, 1, format, ap);
-    va_end(ap);
-
-    output_string = (char *)malloc(output_length + 1);
-    if (!output_string) {
-        fprintf(stderr, "memory allocation failure\n");
-        result = NULL;
-        goto finish;
-    }
-
-    va_start(ap, format);
-    vsprintf(output_string, format, ap);
-    va_end(ap);
-
-    fprintf(stdout, "%s ", output_string);
-    fflush(stdout);
-
-    c = fgetc(stdin);
-    while (c != '\n' && c != EOF) {
-        if (index >= size) {
-            size += 80;
-            result = realloc(result, size);
-            if (!result) {
-                goto finish;
-            }
-        }
-        result[index++] = (char)c;
-        c = fgetc(stdin);
-    }
-    if (c == EOF) {
-        if (result) free(result);
-        result = NULL;
-        goto finish;
-    }
-
-finish:
-    if (output_string) free(output_string);
-
-    return result;
-}
-
-/*******************************************************************************
-* addKextsToManager()
-*
-* Add the kexts named in the kextNames array to the given kext manager, and
-* put their names into the kextNamesToUse.
-*******************************************************************************/
-static Boolean addKextsToManager(
-    KXKextManagerRef aManager,
-    CFArrayRef kextNames,
-    CFMutableArrayRef kextNamesToUse,
-    Boolean do_tests)
-{
-    Boolean result = true;     // assume success
-    KXKextManagerError kxresult = kKXKextManagerErrorNone;
-    CFIndex i, count;
-    KXKextRef theKext = NULL;  // don't release
-    CFURLRef kextURL = NULL;   // must release
-
-   /*****
-    * Add each kext named to the manager.
-    */
-    count = CFArrayGetCount(kextNames);
-    for (i = 0; i < count; i++) {
-        char name_buffer[MAXPATHLEN];
-
-        CFStringRef kextName = (CFStringRef)CFArrayGetValueAtIndex(
-            kextNames, i);
-
-        if (kextURL) {
-            CFRelease(kextURL);
-            kextURL = NULL;
-        }
-
-        kextURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-            kextName, kCFURLPOSIXPathStyle, true);
-        if (!kextURL) {
-            fprintf(stderr, "memory allocation failure\n");
-            result = false;
-            goto finish;
-        }
-
-        if (!CFStringGetCString(kextName,
-            name_buffer, sizeof(name_buffer) - 1, kCFStringEncodingMacRoman)) {
-
-            fprintf(stderr, "memory allocation or string conversion error\n");
-            result = false;
-            goto finish;
-        }
-
-        kxresult = KXKextManagerAddKextWithURL(aManager, kextURL, true, &theKext);
-        if (kxresult != kKXKextManagerErrorNone) {
-            fprintf(stderr, "can't add kernel extension %s (%s)",
-                name_buffer, KXKextManagerErrorStaticCStringForError(kxresult));
-#if 0
-            if (do_tests && theKext) {
-                fprintf(stderr, "kernel extension problems:\n");
-                KXKextPrintDiagnostics(theKext, stderr);
-            }
-            continue;
-#endif 0
-        }
-        if (kextNamesToUse && theKext &&
-            (kxresult == kKXKextManagerErrorNone || do_tests)) {
-
-            CFArrayAppendValue(kextNamesToUse, kextName);
-        }
-    }
-
-finish:
-    if (kextURL) CFRelease(kextURL);
-    return result;
-}
-
-/*******************************************************************************
 * usage()
 *******************************************************************************/
 static void usage(int level)
@@ -2053,7 +1860,8 @@ static void usage(int level)
       "       [-r] [-s | -S] [-t] [-v [1-6]] [-z] [kext_or_directory] ...\n"
       "\n",
       progname);
-    fprintf(stderr, "       %s [-f] -u volume\n\n", progname);
+    fprintf(stderr, "       %s [-v [#]] [-f] -u volume\n", progname);
+    fprintf(stderr, "       %s [-v [#]] -U volume\n\n", progname);
 
     if (level < 1) {
         return;
@@ -2101,11 +1909,13 @@ static void usage(int level)
     fprintf(stderr,
         "  -t: Perform diagnostic tests on kexts and print results\n");
     fprintf(stderr,
+        "  -u/-U: update any caches needed for booting (-U errors if out of date)\n");
+    fprintf(stderr,
         "  -v: verbose mode; print info about caching process\n");
     fprintf(stderr,
         "  -z: don't authenticate kexts (for use during development)\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "At least one of -k, -c or -m must be specified.\n");
+    fprintf(stderr, "At least one of -k, -c, -m, -u, or -U must be specified.\n");
     fprintf(stderr,
         "-l/-L and -n/-N may both be specified to make a cache of local-\n"
         "and network-root kexts\n");
