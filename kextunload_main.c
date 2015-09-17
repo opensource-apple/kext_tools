@@ -62,7 +62,7 @@ int main(int argc, const char *argv[]) {
         progname = (char *)argv[0];
     }
 
-    kern_result = IOMasterPort(NULL, &gMasterPort);
+    kern_result = IOMasterPort(MACH_PORT_NULL, &gMasterPort);
     if (kern_result != KERN_SUCCESS) {
         qerror("can't get I/O Kit master port\n");
         exit_code = 1;

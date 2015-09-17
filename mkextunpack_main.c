@@ -20,7 +20,7 @@ __private_extern__ u_int32_t local_adler32(u_int8_t *buffer, int32_t length);
 
 CFDictionaryRef extractEntriesFromMkext(char * mkextFileData, char * arch);
 Boolean uncompressMkextEntry(
-    char * mkext_base_address,
+    void * mkext_base_address,
     mkext_file * entry_address,
     CFDataRef * uncompressedEntry);
 Boolean writeEntriesToDirectory(CFDictionaryRef entries,
@@ -459,7 +459,7 @@ finish:
 *
 *******************************************************************************/
 Boolean uncompressMkextEntry(
-    char * mkext_base_address,
+    void * mkext_base_address,
     mkext_file * entry_address,
     CFDataRef * uncompressedEntry)
 {
@@ -556,7 +556,7 @@ Boolean writeEntriesToDirectory(CFDictionaryRef entryDict,
 	CFDictionaryRef plist;
 	CFStringRef executableString;
 
-        const char * file_data = NULL;
+        const void * file_data = NULL;
         int fd;
         CFIndex bytesWritten;
 

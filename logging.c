@@ -43,7 +43,7 @@ void kextd_syslog(const char * format, ...)
     va_list ap;
 
     va_start(ap, format);
-    vsyslog(LOG_INFO, format, ap);
+    vsyslog(LOG_NOTICE, format, ap);		// LOG_INFO disabled as of 10.4
     va_end(ap);
 
     return;

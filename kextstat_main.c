@@ -29,7 +29,7 @@ int main(int argc, const char * argv[])
     kern_return_t mach_result = KERN_SUCCESS;
     port_t host_port = PORT_NULL;
     kmod_info_t * kmod_list = NULL;
-    int kmod_bytecount;  // not really used
+    unsigned kmod_bytecount;  // not really used
     int kmod_count;
     kmod_info_t * this_kmod;
     kmod_reference_t * kmod_ref;

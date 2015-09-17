@@ -136,6 +136,14 @@ static int compressFile(
         goto finish;
     }
 
+    if ( (statbuf.st_uid != 0) || (statbuf.st_gid != 0 ) ||
+        (statbuf.st_mode & S_IWOTH) || (statbuf.st_mode & S_IWGRP) ) {
+
+        fprintf(stderr, "%s is not authentic\n", fileName);
+        result = 0;
+        goto finish;
+    }
+
     src = mmap(0, (size_t) statbuf.st_size, PROT_READ, MAP_FILE, fd, 0);
     if (-1 == (int) src) {
         fprintf(stderr, "can't map file %s - %s\n", fileName, strerror(errno));

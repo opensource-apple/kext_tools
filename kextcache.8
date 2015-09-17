@@ -23,6 +23,10 @@
 .Op Fl z
 .Op Ar kext_or_directory
 \&.\|.\|.
+.Nm
+.Op Fl f
+.Fl u
+.Ar os_volume
 .Sh DESCRIPTION
 The
 .Nm
@@ -115,6 +119,11 @@ for the /System/Library/Extensions folder.
 Fork a child process and exit immediately.
 This allows a cache update during system startup to continue
 without delaying startup.
+.It Fl f
+Used with
+.Fl u
+to specify that everything should be updated regardless of "bootstamp"
+information.
 .It Fl h
 Extended usage statement
 .It Fl k
@@ -223,20 +232,28 @@ authentication, and dependency resolution; a failure at any
 stage can make tests in further stages impossible.
 Thus, a kext with validation failures may have unreported
 authentication problems or missing dependencies.
+.It Fl u Ar os_volume
+Update boot caches and any helper partitions associated with
+.Ar os_volume .
+The mkext is always updated.  By default, only caches which have changed
+since the last update are copied to the helper partitions.  See also
+.Fl f .
+OS volumes without
+.Pa /usr/standalone/bootcaches.plist
+are ignored (success is returned).
 .It Fl v Op 1-6
 Verbose mode; print information about the kext scanning and loading
-process. Higher levels of verbosity include all lower levels.
-With this program only verbose levels 1-3 are useful.
-The levels of verbose output are these:
+process. Higher levels of verbosity include all lower levels.  With this
+program only verbose levels 1-3 are useful.  The levels of verbose output
+are these:
 .Bl -tag -width "xxx"
 .It 1
 prints basic kext scanning and archiving information
 .It 2
 prints basic compression information
 .It 3
-prints detailed kext scanning information;
-also uncompresses mkext cache entries to make sure
-they do so without error
+prints detailed kext scanning information; also uncompresses mkext cache
+entries to make sure they do so without error
 .It 4
 prints basic information on every kext encountered
 .It 5

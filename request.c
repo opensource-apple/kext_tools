@@ -8,6 +8,7 @@
 #include <mach/bootstrap.h>
 #include <mach/kmod.h>
 
+#include "bootroot.h"
 #include "globals.h"
 #include <IOKit/kext/KXKextManager.h>
 #include <IOKit/kext/kextmanager_types.h>
@@ -288,6 +289,7 @@ void kextd_handle_kernel_request(void * info)
 
         if (kmod_name) {
 	    KXKextManagerError load_result;
+	    Boolean isGPT;
 	    static boolean_t have_signalled_load = FALSE;
 
             kextd_load_kext(kmod_name, &load_result);
@@ -296,7 +298,8 @@ void kextd_handle_kernel_request(void * info)
 	    if ((load_result == kKXKextManagerErrorNone ||
 		    load_result == kKXKextManagerErrorAlreadyLoaded)
 		    && !have_signalled_load
-		    && (getppid() > 1)) {
+		    && (getppid() > 1)
+		    && !(isBootRoot("/", &isGPT) && isGPT)) {
 		// ppid == 1 => parent is no longer waiting
 		have_signalled_load = TRUE;
 		int ret;
@@ -422,9 +425,12 @@ static KXKextManagerError __kextd_load_kext(KXKextRef theKext,
     if (load_result == kKXKextManagerErrorCache) {
         kextd_error_log("scheduling rescan of all kexts due to cache "
             "inconsistency");
+	kextd_handle_sighup(SIGHUP);  // or I could have kill()'d getpid(:) 
+	/*
         // do not take the runloop source lock here, we're in the same thread
         CFRunLoopSourceSignal(gRescanRunLoopSource);
         CFRunLoopWakeUp(gMainRunLoop);
+	*/
         goto finish;
 
     } else if (load_result == kKXKextManagerErrorAlreadyLoaded ||

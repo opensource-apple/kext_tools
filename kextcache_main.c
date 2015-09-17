@@ -1,6 +1,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFBundlePriv.h>
+#include <err.h>    	// warn[x]
+#include <errno.h>
 #include <libc.h>
+#include <stdlib.h> 	// devname()
+#include <libgen.h>	// dirname()
 #include <Kernel/libsa/mkext.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -11,11 +15,16 @@
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <mach/mach_error.h>
+#include <mach/mach_port.h>	// mach_port_allocate()
+#include <mach/mach_types.h>
 #include <mach/machine/vm_param.h>
 #include <mach/kmod.h>
-#include <mach/mach_types.h>
+#include <servers/bootstrap.h>	// bootstrap mach ports
+#include <unistd.h>		// sleep(3)
+
 
 #include <IOKit/kext/KXKextManager.h>
+#include <IOKit/kext/kextmanager_types.h>
 #include <IOKit/IOTypes.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOKitServer.h>
@@ -23,17 +32,36 @@
 #include <IOKit/IOCFSerialize.h>
 #include <libkern/OSByteOrder.h>
 
+#include "bootroot.h"
+#include "update_boot.h"
 
+// XX need to export kextmanager.h from IOKitUser
+// #include "kextmanager.h"	// since we didn't want to generate a .c file
+kern_return_t kextmanager_lock_volume(mach_port_t p,
+			    mach_port_t client, char *volDev, int *lockstatus);
+kern_return_t kextmanager_unlock_volume(mach_port_t p,
+			    mach_port_t client, char *volDev, int result);
+
+
+// XX: switch to bootfiles.h when we get the chance
 #define DEFAULT_CACHE_DIR	"/System/Library/Caches/com.apple.kernelcaches"
 #define SA_HAS_RUN_PATH		"/var/db/.AppleSetupDone"
 #define kKXROMExtensionsFolder  "/System/Library/Caches/com.apple.romextensions/"
 #define TEMP_DIR		"/com.apple.iokit.kextcache.mkext.XX"
 
-/*******************************************************************************
-* Global variables.
-*******************************************************************************/
+#define LCK_MAXTRIES 10
+#define LCK_DELAY    30 	// up to five minutes of waiting
 
+/*******************************************************************************
+* Program Globals
+*******************************************************************************/
 char * progname = "(unknown)";
+
+/*******************************************************************************
+* File-Globals
+*******************************************************************************/
+static mach_port_t sLockPort = nil;
+static mach_port_t sKextdPort = nil;
 
 /*******************************************************************************
 * Extern functions.
@@ -101,6 +129,12 @@ static void collectKextsForMkextCache(
     int verbose_level,
     Boolean do_tests);
 
+// locking: "put" and "take" indicate that routines decide if a lock is needed
+// int takeVolumeForPaths(char *volPath, int filec, const char *files[]);
+static int takeVolumeForPath(const char *path);
+static int takeVolume(dev_t devid);
+// static int putVolumeForPath(const char *path, int status);
+
 __private_extern__ void verbose_log(const char * format, ...);
 static void error_log(const char * format, ...);
 static int user_approve(int default_answer, const char * format, ...);
@@ -132,6 +166,8 @@ int main(int argc, const char * argv[])
 
    /*****
     * Set by command line option flags.
+    * XX a struct would allow much simpler initialization
+    * *and* allow argument processing elsewhere.
     */
     Boolean do_tests = false;                // -t
     Boolean forkExit = false;                // -F
@@ -150,6 +186,8 @@ int main(int argc, const char * argv[])
     Boolean include_kernel_requests = false;
     Boolean cache_looks_uptodate = false;
     Boolean debug_mode = false;		     // -d
+    Boolean forceUpdate = false;             // -f
+    char *updateRoot = NULL;		     // -u
     int verbose_level = 0;		     // -v
     const char * default_kernel_file = "/mach_kernel";
     const char * kernel_file = default_kernel_file;  // overriden by -K option
@@ -163,6 +201,7 @@ int main(int argc, const char * argv[])
     struct stat extensions_stat_buf;
     struct stat rom_extensions_stat_buf;
     Boolean have_kernel_time, have_extensions_time;
+    Boolean need_default_kernelcache_info = false;
     struct timeval _cacheFileTimes[2];
     struct timeval *cacheFileTimes = NULL;
 
@@ -338,32 +377,13 @@ int main(int argc, const char * argv[])
     if (!platform_name_root_path.platform_name[0] || !platform_name_root_path.root_path[0])
 	platform_name_root_path.platform_name[0] = platform_name_root_path.root_path[0] = 0;
 
-    have_kernel_time     = (0 == stat(kernel_file,       &kernel_stat_buf));
-    have_extensions_time = (0 == stat(source_extensions, &extensions_stat_buf));
-
-    if (have_kernel_time || have_extensions_time)
-    {
-	cacheFileTimes = _cacheFileTimes;
-	if (!have_kernel_time 
-	    || (have_extensions_time && (extensions_stat_buf.st_mtime > kernel_stat_buf.st_mtime)))
-	{
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
-	}
-	else
-	{
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &kernel_stat_buf.st_atimespec);
-	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &kernel_stat_buf.st_mtimespec);
-	}
-	cacheFileTimes[1].tv_sec++;
-    }
     /*****
     * Process command line arguments. If running in kextload-compatibiliy
     * mode, accept its old set of options and none other. If running in
     * the new mode, process the new, larger set of options.
     */
     while ((optchar = getopt(argc, (char * const *)argv,
-               "a:cdeFhkK:lLm:nNrsStvz")) != -1) {
+               "a:cdefFhkK:lLm:nNrsStu:vz")) != -1) {
 
         switch (optchar) {
 
@@ -431,58 +451,7 @@ int main(int argc, const char * argv[])
             }
 
 	    if (optind >= argc) {
-
-		// default args for kextd's usage
-
-		kernelCacheFilename = DEFAULT_CACHE_DIR "/kernelcache";
-		struct stat cache_stat_buf;
-
-		if ((-1 == stat(DEFAULT_CACHE_DIR, &cache_stat_buf))
-		    || !(S_IFDIR & cache_stat_buf.st_mode)) {
-		    mkdir(DEFAULT_CACHE_DIR, 0755);
-		}
-		// Make sure we scan the standard Extensions folder.
-		CFArrayAppendValue(repositoryDirectories,
-		    kKXSystemExtensionsFolder);
-		// Make sure we scan the ROM Extensions folder.
-		if (0 == stat(kKXROMExtensionsFolder, &rom_extensions_stat_buf))
-		    CFArrayAppendValue(repositoryDirectories, CFSTR(kKXROMExtensionsFolder));
-
-		if (!platform_name_root_path.platform_name[0]) {
-		    // need more than the minimal set
-		    local_for_repositories = true;
-		}
-
-		if (!include_kernel_requests) {
-		    // this cache isn't tied to a config
-		    platform_name_root_path.root_path[0] = platform_name_root_path.platform_name[0] = 0;
-		}
-	
-		if (platform_name_root_path.platform_name[0] || platform_name_root_path.root_path[0])
-		{
-		    sprintf(kernelCacheBuffer, "%s.%08X", 
-			kernelCacheFilename,
-			NXSwapHostIntToBig(local_adler32((u_int8_t *) &platform_name_root_path, 
-					    sizeof(platform_name_root_path))));
-		    kernelCacheFilename = kernelCacheBuffer;
-		}
-
-		if ((0 == stat(kernelCacheFilename, &cache_stat_buf))
-		    && have_kernel_time && have_extensions_time)
-		{
-		    if ((cache_stat_buf.st_mtime > kernel_stat_buf.st_mtime)
-  		     &&  (cache_stat_buf.st_mtime > extensions_stat_buf.st_mtime)
-		     &&  (cache_stat_buf.st_mtime == cacheFileTimes[1].tv_sec))
-			cache_looks_uptodate = true;
-		}
-
-		if (-1 == stat(SA_HAS_RUN_PATH, &cache_stat_buf)) {
-		    if (verbose_level >= 1) {
-			verbose_log("SetupAssistant not yet run");
-		    }
-		    exit(0);
-		}
-
+                need_default_kernelcache_info = true;
 	    } else {
 		kernelCacheFilename = argv[optind++];
 	    }
@@ -518,6 +487,14 @@ int main(int argc, const char * argv[])
           case 't':
             do_tests = true;
             break;
+
+	  case 'u':
+	    updateRoot = optarg;
+	    break;
+	  
+	  case 'f':
+	    forceUpdate = true;
+	    break;
 
           case 'v':
             {
@@ -556,6 +533,11 @@ int main(int argc, const char * argv[])
 	  exit_code = 0;
 	  goto finish;
 
+	case '?':
+	  usage(0);
+	  exit_code = 1;	// should be EX_USAGE (sysexits.h)
+	  goto finish;
+
         default:
             fprintf(stderr, "unknown option -%c\n", optchar);
             usage(0);
@@ -564,6 +546,93 @@ int main(int argc, const char * argv[])
         }
     }
 
+   /* Try a lock on the volume for the mkext being updated.
+    */
+    if (mkextFilename) {
+        result = takeVolumeForPath(mkextFilename);
+        if (result) {
+            goto finish;
+        }
+    }
+
+   /* Get the default kernel timestamps before mucking with kernelcache info.
+    */
+    have_kernel_time     = (0 == stat(kernel_file,       &kernel_stat_buf));
+    have_extensions_time = (0 == stat(source_extensions, &extensions_stat_buf));
+
+    if (have_kernel_time || have_extensions_time)
+    {
+	cacheFileTimes = _cacheFileTimes;
+	if (!have_kernel_time 
+	    || (have_extensions_time && (extensions_stat_buf.st_mtime > kernel_stat_buf.st_mtime)))
+	{
+	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &extensions_stat_buf.st_atimespec);
+	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &extensions_stat_buf.st_mtimespec);
+	}
+	else
+	{
+	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &kernel_stat_buf.st_atimespec);
+	    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &kernel_stat_buf.st_mtimespec);
+	}
+	cacheFileTimes[1].tv_sec++;
+    }
+
+   /* If -c was given as the last argument, get the default kernelcache info
+    * using information gleaned from the previous default kernel file stats.
+    */
+    if (need_default_kernelcache_info) {
+        // default args for kextd's usage
+
+        kernelCacheFilename = DEFAULT_CACHE_DIR "/kernelcache";
+        struct stat cache_stat_buf;
+
+        if ((-1 == stat(DEFAULT_CACHE_DIR, &cache_stat_buf))
+            || !(S_IFDIR & cache_stat_buf.st_mode)) {
+            mkdir(DEFAULT_CACHE_DIR, 0755);
+        }
+        // Make sure we scan the standard Extensions folder.
+        CFArrayAppendValue(repositoryDirectories,
+            kKXSystemExtensionsFolder);
+        // Make sure we scan the ROM Extensions folder.
+        if (0 == stat(kKXROMExtensionsFolder, &rom_extensions_stat_buf))
+            CFArrayAppendValue(repositoryDirectories, CFSTR(kKXROMExtensionsFolder));
+
+        if (!platform_name_root_path.platform_name[0]) {
+            // need more than the minimal set
+            local_for_repositories = true;
+        }
+
+        if (!include_kernel_requests) {
+            // this cache isn't tied to a config
+            platform_name_root_path.root_path[0] = platform_name_root_path.platform_name[0] = 0;
+        }
+
+        if (platform_name_root_path.platform_name[0] || platform_name_root_path.root_path[0])
+        {
+            sprintf(kernelCacheBuffer, "%s.%08X", 
+                kernelCacheFilename,
+                NXSwapHostIntToBig(local_adler32((u_int8_t *) &platform_name_root_path, 
+                                    sizeof(platform_name_root_path))));
+            kernelCacheFilename = kernelCacheBuffer;
+        }
+
+        if ((0 == stat(kernelCacheFilename, &cache_stat_buf))
+            && have_kernel_time && have_extensions_time)
+        {
+            if ((cache_stat_buf.st_mtime > kernel_stat_buf.st_mtime)
+             &&  (cache_stat_buf.st_mtime > extensions_stat_buf.st_mtime)
+             &&  (cache_stat_buf.st_mtime == cacheFileTimes[1].tv_sec))
+                cache_looks_uptodate = true;
+        }
+
+        if (-1 == stat(SA_HAS_RUN_PATH, &cache_stat_buf)) {
+            if (verbose_level >= 1) {
+                verbose_log("SetupAssistant not yet run");
+            }
+            exit(0);
+        }
+    }
+    
    /* Update argc, argv based on option processing.
     */
     argc -= optind;
@@ -572,11 +641,33 @@ int main(int argc, const char * argv[])
    /*****
     * Check for bad combinations of options.
     */
-    if (!mkextFilename && !kernelCacheFilename && !repositoryCaches) {
-        fprintf(stderr, "no work to do; one of -m, -c or -k must be specified\n");
-        usage(0);
+    if (!mkextFilename && !kernelCacheFilename && !repositoryCaches
+	    && !updateRoot) {
+        fprintf(stderr, "no work to do; one of -m, -c, -k, or -u must be specified\n");
+        usage(1);
         exit_code = 1;
         goto finish;
+    }
+
+    if (updateRoot) {
+	struct stat sb;
+
+	if (mkextFilename || kernelCacheFilename || repositoryCaches) {
+	    fprintf(stderr, "-u (auto-update) incompatible with other flags\n");
+	    usage(0);
+	    exit_code = 1;
+	    goto finish;
+	}
+
+	if (stat(updateRoot, &sb)) {
+	    warn("%s", updateRoot);
+	    exit_code = 1;
+	} else {
+	    exit_code = updateBoots(updateRoot, argc, argv, forceUpdate,
+				/*gross*/verbose_level);
+	}
+
+	goto finish;
     }
 
    /*****
@@ -1076,9 +1167,203 @@ finish:
     if (checkDictionary)       CFRelease(checkDictionary);
 
     if (theKextManager)        CFRelease(theKextManager);
+    putVolumeForPath(mkextFilename, exit_code);	    // handles not locked
 
     exit(exit_code);
     return exit_code;
+}
+
+/*******************************************************************************
+* takeVolume takes a dev_t to lock with kextd
+*******************************************************************************/
+// upstat() stat()s up the parental chain if a file doesn't exist
+static int upstat(const char *path, struct stat *sb)
+{
+    int rval;
+    const char *tpath = path;
+
+    while ((rval = stat(tpath, sb)) != 0 && errno == ENOENT) {
+	// "." and "/" should always exist, but you never know
+	if (tpath[0] == '.' && tpath[1] == '\0')  goto finish;
+	if (tpath[0] == '/' && tpath[1] == '\0')  goto finish;
+	tpath = dirname(tpath);	    // our dirname() takes a const char*
+    }
+
+finish:
+    if (rval)
+	warn("couldn't find volume for %s", path);
+
+    return rval;
+}
+
+// takeVolumeForPath used by forms other than '-u' (e.g. mkext)
+static int takeVolumeForPath(const char *path)
+{
+    int rval = ELAST + 1;
+    struct stat sb;
+
+    rval = upstat(path, &sb);
+    if (rval)  goto finish;
+    rval = takeVolume(sb.st_dev);
+
+finish:
+    return rval;
+}
+
+// takeVolumeForPaths ensures all paths are on the given volume, then locks
+int takeVolumeForPaths(char *volPath, int filec, const char *files[])
+{
+    int rval, bsderr, i;
+    struct stat volsb;
+
+    bsderr = stat(volPath, &volsb);
+    if (bsderr)  goto finish;
+
+    for (i = 0; i < filec; i++) {
+	struct stat sb;
+
+	rval = upstat(files[i], &sb);
+	if (rval)  goto finish;
+
+	// better be on the same device as the volume
+	if (sb.st_dev != volsb.st_dev) {
+	    warnx("can't lock: %s, %s on different volumes", volPath, files[i]);
+	    goto finish;
+	}
+    }
+
+    rval = takeVolume(volsb.st_dev);
+
+finish:
+    if (bsderr) {
+	warn("couldn't lock paths on volume %s", volPath);
+	rval = bsderr;
+    } 
+
+    return rval;
+}
+
+// can return success if a lock isn't needed
+// can return failure if sLockPort is already in use
+static int takeVolume(dev_t devid)
+{
+    int rval = ELAST + 1;
+    int lckstatus, nretries = LCK_MAXTRIES;
+    Boolean createdPort = false;
+    dev_path_t voldev = "<unknown>";
+    kern_return_t macherr = KERN_SUCCESS;
+    mach_port_t tport = MACH_PORT_NULL;
+
+    if (sLockPort)  goto finish;    // only support one lock at a time :)
+
+    if (getuid() != 0) {
+	// kextd shouldn't be watching anything you can touch
+	// and ignores locking requests from non-root anyway
+	rval = 0;
+	goto finish;
+    }
+
+    tport = mach_task_self();
+    if (tport == MACH_PORT_NULL)  goto finish;
+
+    // look up kextd if not cached
+    if (!sKextdPort) {
+	mach_port_t bsport;
+	macherr = task_get_bootstrap_port(tport, &bsport);
+	if (macherr)  goto finish;
+	macherr = bootstrap_look_up(bsport, KEXTD_SERVER_NAME, &sKextdPort);
+	if (macherr)  goto finish;
+    }
+
+    // convert dev_t into diskXsY
+    if(!devname_r(devid, S_IFBLK, voldev, DEVMAXPATHSIZE))  goto finish;
+
+    // allocate a port to pass (in case we die -- it's released on exit() :)
+    macherr = mach_port_allocate(tport,MACH_PORT_RIGHT_RECEIVE,&sLockPort);
+    createdPort = true;
+    if (macherr)  goto finish;
+    // take the lock in a retry/delay loop in case the volume is busy
+    do {
+	macherr = kextmanager_lock_volume(sKextdPort, sLockPort, voldev,&lckstatus);
+	if (macherr)  goto finish;
+
+	if (lckstatus == EBUSY) {
+	    warnx("%s locked; sleeping (%d retries left)", voldev, --nretries);
+	    sleep(LCK_DELAY);
+	}
+    } while (lckstatus == EBUSY && nretries > 0);
+
+    rval = lckstatus;
+
+
+finish:
+    // if kextd isn't competing with us, then we didn't need the lock
+    if (lckstatus == ENOENT || macherr == BOOTSTRAP_UNKNOWN_SERVICE) {
+	mach_port_mod_refs(tport, sLockPort, MACH_PORT_RIGHT_RECEIVE, -1);
+	sLockPort = nil;
+	rval = 0;
+    } else if (macherr != KERN_SUCCESS) {
+	if (macherr <= KERN_RETURN_MAX) {
+	    warnx("couldn't lock %s: %s",voldev,mach_error_string(macherr));
+	} else {
+	    warnx("couldn't lock %s: error %d", voldev, macherr);
+	}
+	rval = macherr;
+    } else {
+	if (rval) {
+	    warnx("couldn't lock %s: %s", voldev, strerror(rval));
+	}
+    }
+
+    if (rval && createdPort) {
+	mach_port_mod_refs(tport, sLockPort, MACH_PORT_RIGHT_RECEIVE, -1);
+	sLockPort = nil;
+    }
+
+    return rval;
+}
+
+
+/*******************************************************************************
+* putVolumeForPath will unlock the relevant volume, passing 'status' to
+* inform kextd whether of our potential success
+*******************************************************************************/
+int putVolumeForPath(const char *path, int status)
+{
+    int rval = KERN_SUCCESS;
+    struct stat sb;
+    dev_path_t voldev;
+
+    // if not locked, don't sweat it
+    if (!sLockPort) {
+	rval = 0;
+	goto finish;
+    }
+
+    rval = upstat(path, &sb);
+    if (rval)  goto finish;
+    // get "diskXsY"
+    if(!devname_r(sb.st_dev, S_IFBLK, voldev, DEVMAXPATHSIZE))  goto finish;
+
+    rval = kextmanager_unlock_volume(sKextdPort, sLockPort, voldev, status);
+
+    // the server will clean us up (with an error logged) if we couldn't
+    mach_port_mod_refs(mach_task_self(), sLockPort, MACH_PORT_RIGHT_RECEIVE,-1);
+    sLockPort = nil;
+
+finish:
+    if (rval) {
+	if (rval == -1) {
+	    warn("trouble unlocking volume for %s", path);
+	} else if (rval <= KERN_RETURN_MAX) {
+	    warnx("couldn't unlock volume for %s: %s",
+		path, mach_error_string(rval));
+	} else {
+	    warnx("couldn't unlock volume for %s: error %d", path, rval);
+	}
+    }
+
+    return rval;
 }
 
 /*******************************************************************************
@@ -1761,12 +2046,14 @@ finish:
 *******************************************************************************/
 static void usage(int level)
 {
-
     fprintf(stderr,
       "usage: %s [-a arch] [-c kernel_cache_filename] [-e] [-F] [-h] [-k]\n"
-      "    [-K kernel_filename] [-l | -L] [-r] [-m mkext_filename] [-n | -N]\n"
-      "    [-r] [-s | -S] [-t] [-v [1-6]] [-z] [kext_or_directory] ...\n\n",
+      "       [-K kernel_filename] [-l | -L] [-r] [-m mkext_filename] [-n | -N]"
+      "\n"
+      "       [-r] [-s | -S] [-t] [-v [1-6]] [-z] [kext_or_directory] ...\n"
+      "\n",
       progname);
+    fprintf(stderr, "       %s [-f] -u volume\n\n", progname);
 
     if (level < 1) {
         return;

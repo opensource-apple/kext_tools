@@ -885,8 +885,8 @@ PreLink(KXKextManagerRef theKextManager, CFDictionaryRef kextDict,
 
     // compresss
     {
-	char *    buf;
-	char *    bufend;
+	void *    buf;
+	void *    bufend;
 	vm_size_t bufsize;
 	struct {
 	    uint32_t  signature;
