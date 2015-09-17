@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -20,29 +20,28 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
-#include <libc.h>
-#include <IOKit/kext/KXKextManager.h>
+/*
+ * FILE: bootroot_internal.h
+ * AUTH: Soren Spies (sspies)
+ * DATE: 8 June 2006 (as update_boot.h)
+ * DESC: routines for implementing 'kextcache -u' functionality (4252674)
+ *       in which bootcaches.plist files get copied to any Apple_Boots
+ */
 
-extern KXKextManagerLogLevel   g_verbose_level;
-extern const char *progname;
+#include <sys/types.h>      // mode_t
+#include <CoreFoundation/CoreFoundation.h>
 
-CFStringRef createCFString(char * string);
+#include "bootroot.h"
 
-Boolean check_dir(const char * dirname, int writeable, int print_err);
-void qerror(const char * format, ...);
+// in update_boot.c
 
-void basic_log(const char * format, ...);
-void verbose_log(const char * format, ...);
-void error_log(const char * format, ...);
+int checkUpdateCachesAndBoots(
+    CFURLRef volumeURL,
+    Boolean force,
+    Boolean expectUpToDate,
+    Boolean cachesOnly);
 
-int addKextsToManager(
-    KXKextManagerRef aManager,
-    CFArrayRef kextNames,
-    CFMutableArrayRef kextArray,
-    Boolean do_tests);
-
-int fork_program(
-    const char * argv0,
-    char * const argv[],
-    int delay,
-    Boolean wait);
+// "put" and "take" let routines decide if a lock is needed (e.g. if no kextd)
+// only used by volume lockers (kextcache, libBootRoot clients, !kextd)
+int takeVolumeForPath(const char *volPath);
+int putVolumeForPath(const char *path, int status);
